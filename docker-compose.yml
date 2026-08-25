@@ -1,0 +1,93 @@
+# docker-compose.yml - Local development environment
+
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    ports:
+      - "${FALKORDB_HOST_PORT:-6379}:6379" # Redis/FalkorDB
+      - "${FALKORDB_BROWSER_HOST_PORT:-3000}:3000" # Official local graph browser UI (FalkorDB built-in)
+    volumes:
+      - falkordb_data:/data # Persistent data
+      - ./backups/falkordb:/backups # Local backups
+    environment:
+      # Aggressive persistence: save every 60s if 1 key changed, enable AOF
+      # Note: --dir is NOT set here because FalkorDB's run.sh always appends
+      # --dir $FALKORDB_DATA_PATH after REDIS_ARGS, so any --dir in REDIS_ARGS
+      # is silently overridden. We set FALKORDB_DATA_PATH=/data instead.
+      - REDIS_ARGS=${FALKORDB_REDIS_ARGS:---save 60 1 --appendonly yes --appendfsync everysec}
+      - FALKORDB_DATA_PATH=/data
+      - REDIS_PASSWORD=${FALKORDB_PASSWORD:-}
+    healthcheck:
+      test: [ "CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli -a \"$$REDIS_PASSWORD\" ping; else redis-cli ping; fi" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.11.3
+    ports:
+      - "${QDRANT_HOST_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_HOST_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - ./backups/qdrant:/backups
+    restart: unless-stopped
+
+  flask-api:
+    build: .
+    ports:
+      - "${AUTOMEM_API_HOST_PORT:-8001}:8001" # Flask API
+    env_file:
+      # Lab harness overrides (scripts/lab/run_recall_test.py writes this file).
+      # Required so SEARCH_*/RECALL_*/CONSOLIDATION_* config actually reaches the
+      # container: `docker compose --env-file` only affects compose-file
+      # interpolation, never container environment.
+      - path: .env.bench
+        required: false
+    environment:
+      FLASK_ENV: development
+      FLASK_DEBUG: "1"
+      PORT: 8001
+      FALKORDB_HOST: falkordb
+      FALKORDB_PORT: 6379
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_TIMEOUT_SECONDS: ${QDRANT_TIMEOUT_SECONDS:-}
+      QDRANT_ENSURE_PAYLOAD_INDEXES: ${QDRANT_ENSURE_PAYLOAD_INDEXES:-true}
+      AUTOMEM_API_TOKEN: ${AUTOMEM_API_TOKEN:-test-token}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-test-admin-token}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+      VOYAGE_MODEL: ${VOYAGE_MODEL:-voyage-4}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      # Pass these through only when intentionally configured. This preserves
+      # Ollama's runtime defaults for EMBEDDING_PROVIDER=ollama and prevents
+      # auto-selection from treating an empty Compose value as configuration.
+      OLLAMA_BASE_URL:
+      OLLAMA_MODEL:
+      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-30}
+      OLLAMA_MAX_RETRIES: ${OLLAMA_MAX_RETRIES:-2}
+      VECTOR_SIZE: ${VECTOR_SIZE:-1024}
+      VECTOR_SIZE_AUTODETECT: ${VECTOR_SIZE_AUTODETECT:-true}
+      # auto tries Voyage, OpenAI, configured Ollama, FastEmbed, then placeholders.
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-auto}
+      MEMORY_CONTENT_HARD_LIMIT: ${MEMORY_CONTENT_HARD_LIMIT:-2000}
+      MEMORY_AUTO_SUMMARIZE: ${MEMORY_AUTO_SUMMARIZE:-true}
+      AUTOMEM_MODELS_DIR: /root/.config/automem/models # Keep in sync with volume mount
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    volumes:
+      - .:/app
+      - fastembed_models:/root/.config/automem/models # Persist embedding models
+    restart: unless-stopped
+
+volumes:
+  falkordb_data:
+  qdrant_data:
+  fastembed_models: # Persistent cache for local embedding models
