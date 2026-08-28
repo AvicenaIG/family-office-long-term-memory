@@ -1,0 +1,226 @@
+# Makefile - Development commands
+.PHONY: help install dev stop test test-node test-parity fmt lint test-integration test-live test-locomo test-locomo-live test-longmemeval test-longmemeval-live test-longmemeval-watch clean logs deploy deploy-check bench-current-state bench-health
+
+VENV_DIR := $(if $(wildcard .venv/bin/python),.venv,venv)
+VENV_BIN := $(VENV_DIR)/bin
+
+# Default target
+help:
+	@echo "🧠 FalkorDB Memory System - Development Commands"
+	@echo ""
+	@echo "Setup:"
+	@echo "  make install    - Set up .venv and install dependencies"
+	@echo "  make dev        - Start local development environment"
+	@echo ""
+	@echo "Development:"
+	@echo "  make test       - Run unit tests only"
+	@echo "  make fmt        - Format code (black + isort)"
+	@echo "  make lint       - Lint code (flake8)"
+	@echo "  make stop       - Stop local containers (keep volumes)"
+	@echo "  make test-integration - Run all tests including integration tests"
+	@echo "  make test-live  - Run integration tests against live Railway server"
+	@echo "  make logs       - Show development logs"
+	@echo "  make clean      - Clean up containers and volumes"
+	@echo ""
+	@echo "Benchmarks:"
+	@echo "  make bench-mini-locomo    - Mini LoCoMo (2 conversations, <5 min)"
+	@echo "  make bench-mini-longmemeval - Mini LongMemEval (stratified 30 questions)"
+	@echo "  make bench-mini           - Both mini benchmarks"
+	@echo "  make bench-ingest BENCH=locomo - Ingest + snapshot (run once)"
+	@echo "  make bench-eval BENCH=locomo CONFIG=baseline - Eval from snapshot (~2 min)"
+	@echo "  make bench-compare BENCH=locomo CONFIG=bm25 BASELINE=baseline - A/B compare"
+	@echo "  make bench-current-state    - No-LLM current-state recall smoke"
+	@echo "  make bench-health             - Recall health check (score dist, entities, latency)"
+	@echo "  make test-locomo          - Full LoCoMo benchmark (local)"
+	@echo "  make test-locomo-live     - Full LoCoMo benchmark (Railway)"
+	@echo "  make test-longmemeval     - Full LongMemEval benchmark (local)"
+	@echo "  make test-longmemeval-live - Full LongMemEval benchmark (Railway)"
+	@echo "  make test-longmemeval-watch - Full LongMemEval with notifications"
+	@echo ""
+	@echo "Deployment:"
+	@echo "  make deploy       - Deploy to Railway"
+	@echo "  make status       - Check deployment status"
+	@echo "  make deploy-check - Compare deployed vs main (maintainers only, needs Railway CLI and gh)"
+
+# Set up development environment
+install:
+	@echo "🔧 Setting up development environment..."
+	@bash scripts/bootstrap_dev.sh
+	@echo "✅ Virtual environment ready!"
+	@echo "💡 Run 'source .venv/bin/activate' to activate"
+
+# Start local development
+dev:
+	@echo "🚀 Starting local development environment..."
+	docker compose up --build
+
+# Stop local development containers (preserve volumes)
+stop:
+	@echo "⏹️  Stopping local development environment..."
+	docker compose down
+
+# Run tests
+test:
+	@echo "🧪 Running unit tests..."
+	@if [ ! -x "$(VENV_BIN)/pytest" ]; then \
+		echo "🔧 $(VENV_BIN)/pytest not found; bootstrapping with 'make install'..."; \
+		$(MAKE) install; \
+	fi
+	PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 $(VENV_BIN)/pytest -rs -m unit
+	@$(MAKE) test-node
+
+# Run the MCP bridge's node suite (parity tests self-skip without a live stack)
+test-node:
+	@echo "🧪 Running MCP bridge node tests..."
+	@cd mcp-sse-server && npm ci --silent && npm test
+
+# Diff the remote and stdio MCP transports against one live AutoMem.
+# See docs/MCP_TRANSPORT_PARITY.md.
+# Deliberately not 8001. The harness writes fixtures and bulk-deletes by tag,
+# and a developer running a local AutoMem install (~/.automem/server) already
+# holds 8001 — pointing this at that instance would seed test data into a real
+# memory store. Own port, own stack, no collision.
+PARITY_PORT ?= 8011
+
+test-parity:
+	@echo "🐳 Starting Docker services on port $(PARITY_PORT)..."
+	@AUTOMEM_API_HOST_PORT=$(PARITY_PORT) AUTOMEM_API_TOKEN=test-token ADMIN_API_TOKEN=test-admin-token docker compose up -d
+	@echo "⏳ Waiting for AutoMem to be ready..."
+	@ready=0; \
+	for i in $$(seq 1 60); do \
+		if curl -fsS http://localhost:$(PARITY_PORT)/health > /dev/null 2>&1; then ready=1; break; fi; \
+		sleep 1; \
+	done; \
+	if [ "$$ready" != "1" ]; then \
+		echo "❌ AutoMem did not become healthy on port $(PARITY_PORT) within 60s"; \
+		docker compose logs --tail=50 flask-api; \
+		exit 1; \
+	fi
+	@echo "🧪 Diffing MCP transports..."
+	@cd mcp-sse-server && npm ci --silent && \
+		AUTOMEM_RUN_PARITY_TESTS=1 \
+		AUTOMEM_PARITY_API_URL=http://localhost:$(PARITY_PORT) \
+		npm test
+
+# Format code
+fmt:
+	@echo "✨ Formatting code (black + isort) ..."
+	$(VENV_BIN)/black .
+	$(VENV_BIN)/isort .
+
+# Lint code
+lint:
+	@echo "🔍 Linting (flake8) ..."
+	$(VENV_BIN)/flake8 .
+
+# Run integration tests (requires Docker services)
+test-integration:
+	@echo "🧪 Running integration tests..."
+	@echo "🐳 Starting Docker services..."
+	@AUTOMEM_API_TOKEN=test-token ADMIN_API_TOKEN=test-admin-token docker compose up -d
+	@echo "⏳ Waiting for services to be ready..."
+	@sleep 5
+	@echo "🧪 Running tests..."
+	@AUTOMEM_RUN_INTEGRATION_TESTS=1 AUTOMEM_TEST_API_TOKEN=test-token AUTOMEM_TEST_ADMIN_TOKEN=test-admin-token PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 $(VENV_BIN)/pytest -rs -m integration
+
+# Run integration tests against live Railway server
+test-live:
+	@./test-live-server.sh
+
+# Show logs
+logs:
+	docker compose logs -f flask-api
+
+# Clean up
+clean:
+	@echo "🧹 Cleaning up..."
+	docker compose down -v || true
+
+# Deploy to Railway
+deploy:
+	@echo "🚀 Deploying to Railway..."
+	railway up
+
+# Check deployment status
+status:
+	@echo "📊 Checking deployment status..."
+	railway status || railway logs
+
+# Compare deployed commit vs origin/main HEAD (detect stale deploys)
+deploy-check:
+	@rc=0; \
+	./scripts/deploy_check.sh automem      || rc=1; \
+	./scripts/deploy_check.sh mcp-automem  || rc=1; \
+	exit $$rc
+
+# Run LoCoMo benchmark (local)
+test-locomo:
+	@./test-locomo-benchmark.sh
+
+# Run LoCoMo benchmark (Railway)
+test-locomo-live:
+	@./test-locomo-benchmark.sh --live
+
+# Run LongMemEval benchmark (local)
+test-longmemeval:
+	@./test-longmemeval-benchmark.sh
+
+# Run LongMemEval benchmark (Railway)
+test-longmemeval-live:
+	@./test-longmemeval-benchmark.sh --live
+
+# Run LongMemEval benchmark with persistent log + local notifications
+test-longmemeval-watch:
+	@./scripts/run_longmemeval_watch.sh
+
+# Mini benchmarks (fast iteration, <5 minutes)
+bench-mini-locomo:
+	@./test-locomo-benchmark.sh --conversations 0,1
+
+bench-mini-longmemeval:
+	@./test-longmemeval-benchmark.sh --llm-eval --per-type 5 --llm-model gpt-5-mini
+
+bench-mini: bench-mini-locomo bench-mini-longmemeval
+
+# Snapshot-based benchmarks (ingest once, eval many)
+bench-ingest:
+	@scripts/bench/ingest_and_snapshot.sh $(or $(BENCH),locomo)
+
+bench-eval:
+	@scripts/bench/restore_and_eval.sh $(or $(BENCH),locomo) $(or $(CONFIG),baseline)
+
+bench-compare:
+	@scripts/bench/compare_configs.sh $(or $(BENCH),locomo) $(or $(BASELINE),baseline) $(CONFIG)
+
+bench-compare-branch:
+	@scripts/bench/compare_branch.sh $(BRANCH) $(or $(CONFIG),baseline) $(or $(BENCH),locomo)
+
+bench-current-state:
+	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 $(VENV_BIN)/pytest tests/test_api_endpoints.py -k 'recall_state_mode or recall_current_only' -q
+
+bench-health:
+	@$(or $(VENV_BIN),.venv/bin)/python scripts/bench/health_check.py --base-url $(or $(BASE_URL),http://localhost:8001)
+
+bench-snapshots:
+	@ls -la benchmarks/snapshots/ 2>/dev/null || echo "No snapshots yet. Run: make bench-ingest BENCH=locomo"
+
+# Recall Quality Lab
+lab-clone:
+	@echo "🔬 Cloning production data to local Docker..."
+	@bash scripts/lab/clone_production.sh
+
+lab-queries:
+	@echo "🔬 Generating test queries from local data..."
+	@python3 scripts/lab/create_test_queries.py
+
+lab-test:
+	@echo "🔬 Running recall quality test..."
+	@python3 scripts/lab/run_recall_test.py --config $(or $(CONFIG),baseline)
+
+lab-compare:
+	@echo "🔬 Comparing configs: $(BASELINE) vs $(CONFIG)..."
+	@python3 scripts/lab/run_recall_test.py --config $(CONFIG) --compare $(or $(BASELINE),baseline)
+
+lab-sweep:
+	@echo "🔬 Sweeping $(PARAM)..."
+	@python3 scripts/lab/run_recall_test.py --sweep $(PARAM) $(VALUES)
