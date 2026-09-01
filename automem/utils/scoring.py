@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from automem.config import (
+    RECALL_RELEVANCE_GATE,
+    SEARCH_RECENCY_CURVE,
+    SEARCH_RECENCY_WINDOW_DAYS,
+    SEARCH_TAG_SCORE_TOKEN_CAP,
+    SEARCH_WEIGHT_CONFIDENCE,
+    SEARCH_WEIGHT_EXACT,
+    SEARCH_WEIGHT_IMPORTANCE,
+    SEARCH_WEIGHT_KEYWORD,
+    SEARCH_WEIGHT_METADATA,
+    SEARCH_WEIGHT_RECENCY,
+    SEARCH_WEIGHT_RELATION,
+    SEARCH_WEIGHT_RELEVANCE,
+    SEARCH_WEIGHT_TAG,
+    SEARCH_WEIGHT_VECTOR,
+)
+from automem.utils.time import _parse_iso_datetime
+
+
+def _parse_metadata_field(value: Any) -> Any:
+    """Convert stored metadata value back into a dictionary when possible."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            decoded = json.loads(value)
+            if isinstance(decoded, dict):
+                return decoded
+        except Exception:
+            return value
+    return value
+
+
+def _collect_metadata_terms(metadata: Dict[str, Any]) -> Set[str]:
+    terms: Set[str] = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, str):
+            trimmed = item.strip()
+            if not trimmed:
+                return
+            if len(trimmed) <= 256:
+                lower = trimmed.lower()
+                terms.add(lower)
+                for token in re.findall(r"[a-z0-9_\-]+", lower):
+                    terms.add(token)
+        elif isinstance(item, (list, tuple, set)):
+            for sub in item:
+                visit(sub)
+        elif isinstance(item, dict):
+            for key, sub in item.items():
+                if key == "entities":
+                    continue
+                visit(sub)
+
+    visit(metadata)
+    return terms
+
+
+def _compute_recency_score(timestamp: Optional[str]) -> float:
+    if not timestamp:
+        return 0.0
+    parsed = _parse_iso_datetime(timestamp)
+    if not parsed:
+        return 0.0
+    from datetime import datetime, timezone  # local import to avoid cycles
+
+    age_days = max((datetime.now(timezone.utc) - parsed).total_seconds() / 86400.0, 0.0)
+    if age_days <= 0:
+        return 1.0
+    if SEARCH_RECENCY_CURVE == "exp":
+        # Exponential decay where the window acts as the half-life.
+        return 0.5 ** (age_days / SEARCH_RECENCY_WINDOW_DAYS)
+    # Linear decay reaching zero at the window boundary
+    return max(0.0, 1.0 - (age_days / SEARCH_RECENCY_WINDOW_DAYS))
+
+
+def _context_tag_hit(tags: Set[str], priority_tags: Set[str]) -> bool:
+    if not tags or not priority_tags:
+        return False
+    # Canonicalize ``/`` and ``:`` to a single ``:`` delimiter on both sides so a
+    # context_tag like ``project:foo`` matches a ``project/foo``-tagged memory
+    # (mirrors ``_expand_tag_prefixes`` in utils.tags). Match semantics are
+    # otherwise unchanged: exact, prefix, or substring.
+    norm_priorities = {re.sub(r"[:/]+", ":", priority) for priority in priority_tags}
+    for tag in tags:
+        norm_tag = re.sub(r"[:/]+", ":", tag)
+        for priority in norm_priorities:
+            if norm_tag == priority or norm_tag.startswith(priority) or priority in norm_tag:
+                return True
+    return False
+
+
+def _compute_context_bonus(
+    result: Dict[str, Any],
+    memory: Dict[str, Any],
+    tag_terms: Set[str],
+    metadata_terms: Set[str],
+    context_family-office-long-term-memory: Optional[Dict[str, Any]],
+) -> float:
+    if not context_family-office-long-term-memory:
+        return 0.0
+
+    weights = context_family-office-long-term-memory.get("weights") or {}
+    priority_tags: Set[str] = context_family-office-long-term-memory.get("priority_tags") or set()
+    priority_types: Set[str] = context_family-office-long-term-memory.get("priority_types") or set()
+    priority_ids: Set[str] = context_family-office-long-term-memory.get("priority_ids") or set()
+    priority_keywords: Set[str] = context_family-office-long-term-memory.get("priority_keywords") or set()
+
+    bonus = 0.0
+    if priority_tags and _context_tag_hit(tag_terms, priority_tags):
+        bonus += float(weights.get("tag", 0.45))
+
+    if priority_types:
+        mem_type = memory.get("type")
+        if isinstance(mem_type, str) and mem_type.strip().title() in priority_types:
+            bonus += float(weights.get("type", 0.25))
+
+    if priority_keywords and metadata_terms:
+        if any(keyword in metadata_terms for keyword in priority_keywords):
+            bonus += float(weights.get("keyword", 0.2))
+
+    if priority_ids:
+        memory_id = str(result.get("id") or memory.get("id") or "")
+        if memory_id and memory_id in priority_ids:
+            bonus += float(weights.get("anchor", 0.9))
+
+    return bonus
+
+
+def _compute_metadata_score(
+    result: Dict[str, Any],
+    query: str,
+    tokens: List[str],
+    context_family-office-long-term-memory: Optional[Dict[str, Any]] = None,
+) -> Tuple[float, Dict[str, Any]]:
+    memory = result.get("memory", {})
+    metadata = _parse_metadata_field(memory.get("metadata")) if memory else {}
+    metadata_terms = _collect_metadata_terms(metadata) if isinstance(metadata, dict) else set()
+
+    tags = memory.get("tags") or []
+    tag_terms = {str(tag).lower() for tag in tags if isinstance(tag, str)}
+
+    token_hits = 0
+    for token in tokens:
+        if token in tag_terms or token in metadata_terms:
+            token_hits += 1
+
+    exact_match = 0.0
+    normalized_query = query.lower().strip()
+    if normalized_query and normalized_query in metadata_terms:
+        exact_match = 1.0
+
+    importance = memory.get("importance")
+    importance_score = float(importance) if isinstance(importance, (int, float)) else 0.0
+
+    confidence = memory.get("confidence")
+    confidence_score = float(confidence) if isinstance(confidence, (int, float)) else 0.0
+
+    recency_score = _compute_recency_score(memory.get("timestamp"))
+
+    if tokens:
+        if SEARCH_TAG_SCORE_TOKEN_CAP > 0:
+            # Cap the denominator so long queries aren't penalized relative to
+            # short ones: a query with more tokens than the cap only needs
+            # `cap` tag/metadata hits for full credit.
+            denominator = max(min(len(tokens), SEARCH_TAG_SCORE_TOKEN_CAP), 1)
+        else:
+            # Legacy behavior (cap == 0): denominator is the full query length.
+            denominator = max(len(tokens), 1)
+        tag_score = min(1.0, token_hits / denominator)
+    else:
+        tag_score = 0.0
+
+    vector_component = (
+        result.get("match_score", 0.0) if result.get("match_type") == "vector" else 0.0
+    )
+    keyword_component = 0.0
+    if result.get("match_type") in {"keyword", "trending"}:
+        # Producers normalize, but no channel may exceed the 0-1 component
+        # contract (issue #190) — an unclamped score also defeats the
+        # RECALL_RELEVANCE_GATE evidence check.
+        keyword_component = min(1.0, float(result.get("match_score", 0.0) or 0.0))
+    elif tokens:
+        content_lower = str(memory.get("content") or "").lower()
+        if content_lower:
+            content_tokens = set(re.findall(r"\b[a-z0-9]+\b", content_lower))
+            if content_tokens:
+                content_hits = sum(1 for token in tokens if token in content_tokens)
+                keyword_component = content_hits / len(tokens)
+
+    metadata_component = (
+        float(result.get("match_score", 0.0) or 0.0)
+        if result.get("match_type") == "metadata"
+        else 0.0
+    )
+
+    # Query-topical evidence: the strongest signal that this result is about
+    # the query itself. Tag overlap is excluded even though it is computed
+    # from query-token hits: inside a tag-scoped pool the scope tag itself
+    # often matches a query token, which makes tag overlap scope-confounded
+    # crumb evidence rather than independent topical evidence. Relation
+    # strength is graph-derived and carries no query signal at all.
+    evidence = max(vector_component, keyword_component, metadata_component, exact_match)
+
+    # Relevance score from consolidation decay (reflects access patterns + age).
+    # Default weight is 0.0 (disabled) — enable via SEARCH_WEIGHT_RELEVANCE env var.
+    relevance = memory.get("relevance_score")
+    relevance_score = float(relevance) if isinstance(relevance, (int, float)) else 0.0
+
+    # Within-pool relevance gate (issue #130): inside a tag-scoped pool,
+    # query-independent components (importance, confidence, recency, tag
+    # crumbs, consolidation relevance) can produce confident-looking final
+    # scores for results with near-zero topical evidence. When the gate is
+    # enabled and evidence falls short, ramp those components down linearly
+    # (evidence / gate — no cliff). Components are scaled *before* weighting
+    # so the `components` breakdown stays truthful. relevance_score is gated
+    # for completeness; with the default SEARCH_WEIGHT_RELEVANCE=0.0 that is
+    # a no-op today. The context bonus is untouched: context_tags is the
+    # explicit soft-boost channel. Gate 0.0 (default) must not even enter
+    # this branch so legacy scores stay bit-identical.
+    relevance_gated = False
+    if tokens and RECALL_RELEVANCE_GATE > 0 and evidence < RECALL_RELEVANCE_GATE:
+        gate_scale = evidence / RECALL_RELEVANCE_GATE
+        importance_score *= gate_scale
+        confidence_score *= gate_scale
+        recency_score *= gate_scale
+        tag_score *= gate_scale
+        relevance_score *= gate_scale
+        relevance_gated = True
+
+    relation_component = 0.0
+    if result.get("match_type") == "relation":
+        relation_component = float(
+            result.get("relation_score", result.get("match_score", 0.0)) or 0.0
+        )
+    elif "relation_score" in result:
+        relation_component = float(result.get("relation_score") or 0.0)
+
+    context_bonus = _compute_context_bonus(
+        result, memory, tag_terms, metadata_terms, context_family-office-long-term-memory
+    )
+
+    final = (
+        SEARCH_WEIGHT_VECTOR * vector_component
+        + SEARCH_WEIGHT_KEYWORD * keyword_component
+        + SEARCH_WEIGHT_METADATA * metadata_component
+        + SEARCH_WEIGHT_RELATION * relation_component
+        + SEARCH_WEIGHT_TAG * tag_score
+        + SEARCH_WEIGHT_IMPORTANCE * importance_score
+        + SEARCH_WEIGHT_CONFIDENCE * confidence_score
+        + SEARCH_WEIGHT_RECENCY * recency_score
+        + SEARCH_WEIGHT_EXACT * exact_match
+        + SEARCH_WEIGHT_RELEVANCE * relevance_score
+        + context_bonus
+    )
+
+    components = {
+        "vector": vector_component,
+        "keyword": keyword_component,
+        "metadata": metadata_component,
+        "relation": relation_component,
+        "tag": tag_score,
+        "importance": importance_score,
+        "confidence": confidence_score,
+        "recency": recency_score,
+        "exact": exact_match,
+        "relevance": relevance_score,
+        "context": context_bonus,
+        "evidence": evidence,
+        "relevance_gated": relevance_gated,
+    }
+
+    return final, components

@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import timedelta
+from typing import Any, Callable, Dict, List, Set
+
+
+def load_control_record(
+    graph: Any,
+    *,
+    logger: Any,
+    control_label: str,
+    control_node_id: str,
+    task_fields: Dict[str, str],
+    utc_now_fn: Callable[[], str],
+) -> Dict[str, Any]:
+    """Fetch or create the consolidation control node."""
+    bootstrap_timestamp = utc_now_fn()
+    bootstrap_fields = sorted(set(task_fields.values()))
+    bootstrap_set_clause = ",\n                ".join(
+        f"c.{field} = coalesce(c.{field}, $now)" for field in bootstrap_fields
+    )
+    try:
+        result = graph.query(
+            f"""
+            MERGE (c:{control_label} {{id: $id}})
+            SET {bootstrap_set_clause}
+            RETURN c
+            """,
+            {"id": control_node_id, "now": bootstrap_timestamp},
+        )
+    except Exception:
+        logger.exception("Failed to load consolidation control record")
+        return {}
+
+    if not getattr(result, "result_set", None):
+        return {}
+
+    node = result.result_set[0][0]
+    properties = getattr(node, "properties", None)
+    if isinstance(properties, dict):
+        return dict(properties)
+    if isinstance(node, dict):
+        return dict(node)
+    return {}
+
+
+def load_recent_runs(
+    graph: Any, limit: int, *, logger: Any, run_label: str
+) -> List[Dict[str, Any]]:
+    """Return recent consolidation run records."""
+    try:
+        result = graph.query(
+            f"""
+            MATCH (r:{run_label})
+            RETURN r
+            ORDER BY r.started_at DESC
+            LIMIT $limit
+            """,
+            {"limit": limit},
+        )
+    except Exception:
+        logger.exception("Failed to load consolidation history")
+        return []
+
+    runs: List[Dict[str, Any]] = []
+    for row in getattr(result, "result_set", []) or []:
+        node = row[0]
+        properties = getattr(node, "properties", None)
+        if isinstance(properties, dict):
+            runs.append(dict(properties))
+        elif isinstance(node, dict):
+            runs.append(dict(node))
+    return runs
+
+
+def apply_scheduler_overrides(
+    scheduler: Any,
+    *,
+    decay_interval_seconds: int,
+    creative_interval_seconds: int,
+    cluster_interval_seconds: int,
+    forget_interval_seconds: int,
+    identity_interval_seconds: int = 0,
+) -> None:
+    """Override default scheduler intervals using configuration."""
+    overrides = {
+        "decay": timedelta(seconds=decay_interval_seconds),
+        "creative": timedelta(seconds=creative_interval_seconds),
+        "cluster": timedelta(seconds=cluster_interval_seconds),
+        "forget": timedelta(seconds=forget_interval_seconds),
+        "identity": timedelta(seconds=identity_interval_seconds),
+    }
+
+    for task, interval in overrides.items():
+        if task in scheduler.schedules:
+            scheduler.schedules[task]["interval"] = interval
+
+
+def tasks_for_mode(mode: str, task_fields: Dict[str, str]) -> List[str]:
+    """Map a consolidation mode to its task identifiers."""
+    if mode == "full":
+        return ["decay", "creative", "cluster", "forget", "identity", "full"]
+    if mode in task_fields:
+        return [mode]
+    return [mode]
+
+
+def _completed_tasks_for_result(
+    mode: str,
+    result: Dict[str, Any],
+    task_fields: Dict[str, str],
+) -> List[str]:
+    """Return tasks whose scheduler timestamps should advance."""
+    steps = result.get("steps") if isinstance(result.get("steps"), dict) else {}
+    completed: List[str] = []
+    for task in tasks_for_mode(mode, task_fields):
+        if task == "identity":
+            identity_step = steps.get("identity")
+            if mode == "full" and identity_step is None:
+                continue
+            if isinstance(identity_step, dict) and (
+                identity_step.get("skipped") or identity_step.get("error")
+            ):
+                continue
+        completed.append(task)
+    return completed
+
+
+def persist_consolidation_run(
+    graph: Any,
+    result: Dict[str, Any],
+    *,
+    logger: Any,
+    run_label: str,
+    control_label: str,
+    control_node_id: str,
+    task_fields: Dict[str, str],
+    history_limit: int,
+    utc_now_fn: Callable[[], str],
+) -> None:
+    """Record consolidation outcomes and update scheduler metadata."""
+    mode = result.get("mode", "unknown")
+    completed_at = result.get("completed_at") or utc_now_fn()
+    started_at = result.get("started_at") or completed_at
+    success = bool(result.get("success"))
+    dry_run = bool(result.get("dry_run"))
+
+    try:
+        graph.query(
+            f"""
+            CREATE (r:{run_label} {{
+                id: $id,
+                mode: $mode,
+                task: $task,
+                success: $success,
+                dry_run: $dry_run,
+                started_at: $started_at,
+                completed_at: $completed_at,
+                result: $result
+            }})
+            """,
+            {
+                "id": uuid.uuid4().hex,
+                "mode": mode,
+                "task": mode,
+                "success": success,
+                "dry_run": dry_run,
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "result": json.dumps(result, default=str),
+            },
+        )
+    except Exception:
+        logger.exception("Failed to record consolidation run history")
+
+    for task in _completed_tasks_for_result(mode, result, task_fields):
+        field = task_fields.get(task)
+        if not field:
+            continue
+        try:
+            graph.query(
+                f"""
+                MERGE (c:{control_label} {{id: $id}})
+                SET c.{field} = $timestamp
+                """,
+                {
+                    "id": control_node_id,
+                    "timestamp": completed_at,
+                },
+            )
+        except Exception:
+            logger.exception("Failed to update consolidation control for task %s", task)
+
+    try:
+        graph.query(
+            f"""
+            MATCH (r:{run_label})
+            WITH r ORDER BY r.started_at DESC
+            SKIP $keep
+            DELETE r
+            """,
+            {"keep": history_limit},
+        )
+    except Exception:
+        logger.exception("Failed to prune consolidation history")
+
+
+def build_consolidator_from_config(
+    graph: Any,
+    vector_store: Any,
+    *,
+    memory_consolidator_cls: Any,
+    collection_name: str = "memories",
+    delete_threshold: float,
+    archive_threshold: float,
+    grace_period_days: int,
+    importance_protection_threshold: float,
+    protected_types: Set[str],
+    base_decay_rate: float = 0.01,
+    importance_floor_factor: float = 0.3,
+    cluster_similarity_threshold: float | None = None,
+    min_cluster_size: int | None = None,
+) -> Any:
+    consolidator = memory_consolidator_cls(
+        graph,
+        vector_store,
+        collection_name=collection_name,
+        delete_threshold=delete_threshold,
+        archive_threshold=archive_threshold,
+        grace_period_days=grace_period_days,
+        importance_protection_threshold=importance_protection_threshold,
+        protected_types=protected_types,
+        base_decay_rate=base_decay_rate,
+        importance_floor_factor=importance_floor_factor,
+    )
+    if cluster_similarity_threshold is not None:
+        consolidator.similarity_threshold = float(cluster_similarity_threshold)
+    if min_cluster_size is not None:
+        consolidator.min_cluster_size = int(min_cluster_size)
+    return consolidator

@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+from typing import Any, Callable, Optional
+
+from flask import Blueprint, jsonify
+
+from automem.sync.accounting import count_falkor_memories, count_qdrant_points
+
+
+def create_health_blueprint(
+    get_memory_graph: Callable[[], Any],
+    get_qdrant_client: Callable[[], Any],
+    state: Any,
+    graph_name: str,
+    collection_name: str,
+    utc_now: Callable[[], str],
+) -> Blueprint:
+    bp = Blueprint("health", __name__)
+
+    @bp.route("/health", methods=["GET"])
+    def health() -> Any:
+        from automem.config import RECALL_EXCLUDED_TYPES, VECTOR_SIZE
+
+        graph_available = get_memory_graph() is not None
+        qdrant_available = get_qdrant_client() is not None
+
+        enrichment_thread_alive = bool(
+            state.enrichment_thread and state.enrichment_thread.is_alive()
+        )
+        with state.enrichment_lock:
+            enrichment_pending = len(state.enrichment_pending)
+            enrichment_inflight = len(state.enrichment_inflight)
+
+        # Get memory count from FalkorDB (gracefully fail if unavailable)
+        memory_count: Optional[int] = None  # keep in sync with config schema
+        if graph_available:
+            try:
+                graph = get_memory_graph()
+                if graph:
+                    memory_count = count_falkor_memories(graph, RECALL_EXCLUDED_TYPES)
+            except Exception:
+                pass
+
+        # Get vector count and dimension from Qdrant (gracefully fail if unavailable)
+        vector_count: Optional[int] = None
+        collection_vector_size: Optional[int] = None
+        if qdrant_available:
+            try:
+                qdrant = get_qdrant_client()
+                if qdrant:
+                    info = qdrant.get_collection(collection_name)
+                    vector_count = count_qdrant_points(
+                        qdrant, collection_name, RECALL_EXCLUDED_TYPES
+                    )
+                    collection_vector_size = info.config.params.vectors.size
+            except Exception:
+                pass
+
+        # Determine sync status
+        sync_status = "unknown"
+        if memory_count is not None and vector_count is not None:
+            if memory_count == vector_count:
+                sync_status = "synced"
+            elif vector_count < memory_count:
+                sync_status = "drift_detected"
+            else:
+                # More vectors than memories (orphaned vectors)
+                sync_status = "orphaned_vectors"
+
+        # Overall status considers sync
+        if not graph_available or not qdrant_available:
+            status = "degraded"
+        elif sync_status == "drift_detected":
+            status = "degraded"
+        else:
+            status = "healthy"
+
+        effective_dim = getattr(state, "effective_vector_size", None)
+        # Only report mismatch when the embedding provider has initialized
+        # (effective_dim is set); suppresses false positives during startup.
+        dim_mismatch = (
+            collection_vector_size is not None
+            and effective_dim is not None
+            and collection_vector_size != VECTOR_SIZE
+        )
+
+        health_data = {
+            "status": status,
+            "falkordb": "connected" if graph_available else "disconnected",
+            "qdrant": "connected" if qdrant_available else "disconnected",
+            "memory_count": memory_count,
+            "vector_count": vector_count,
+            "sync_status": sync_status,
+            "vector_dimensions": {
+                "configured": VECTOR_SIZE,
+                "effective": effective_dim,
+                "collection": collection_vector_size,
+                "mismatch": dim_mismatch,
+            },
+            "enrichment": {
+                "status": "running" if enrichment_thread_alive else "stopped",
+                "queue_depth": (state.enrichment_queue.qsize() if state.enrichment_queue else 0),
+                "pending": enrichment_pending,
+                "inflight": enrichment_inflight,
+                "processed": state.enrichment_stats.successes,
+                "failed": state.enrichment_stats.failures,
+            },
+            "embedding": {
+                **state.embedding_stats,
+                "queue_depth": state.embedding_queue.qsize() if state.embedding_queue else 0,
+                "pending": len(state.embedding_pending),
+                "inflight": len(state.embedding_inflight),
+            },
+            "timestamp": utc_now(),
+            "graph": graph_name,
+        }
+        return jsonify(health_data)
+
+    return bp
