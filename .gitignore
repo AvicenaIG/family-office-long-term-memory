@@ -1,0 +1,49 @@
+.claude/settings.local.json
+*.code-workspace
+.env
+**/__pycache__
+automation_hub_dashboard/.env
+automation_hub_dashboard/.venv/
+reports/
+venv/
+/venv
+/.cursor
+/.worktrees/
+
+# Local backups (use S3 for persistent backups)
+backups/
+
+# Log files
+*.log
+
+tests/benchmarks/locomo/
+tests/benchmarks/longmemeval/data/
+tests/benchmarks/longmemeval/results/
+.DS_Store
+/.venv
+/automem/.venv
+
+# Distribution / packaging
+**/dist/
+
+# Node.js dependencies
+/mcp-sse-server/node_modules/
+node_modules/
+
+# Experiment results (promote notable runs to tests/benchmarks/results/)
+/tests/benchmarks/experiments/results_*/
+
+# Recall Quality Lab data (generated snapshots, test sets, and results)
+/lab/
+
+# Benchmark overrides and snapshots
+.env.bench
+/benchmarks/snapshots/
+/benchmarks/results/
+/benchmarks/public_comparison/
+/scripts/bench/sweep_*.json
+benchmarks/baselines/locomo_baseline.json
+data/bm25_index.db
+data/
+/.agents
+/docs/superpowers/

@@ -1,0 +1,439 @@
+# Remote MCP
+
+The Remote MCP server exposes AutoMem over HTTPS, enabling cloud-based AI platforms to access your memories without local installation. It is also the recommended default for Anthropic surfaces when you want one shared MCP connection across Claude Desktop, Claude.ai, and iOS, because connector state now syncs between those clients.
+
+## Transport Options
+
+AutoMem supports two MCP transport protocols:
+
+| Transport                | Protocol Version | Status         | Endpoint   |
+| ------------------------ | ---------------- | -------------- | ---------- |
+| **Streamable HTTP**      | 2025-03-26       | ✅ Recommended | `/mcp`     |
+| SSE (Server-Sent Events) | 2024-11-05       | ⚠️ Deprecated  | `/mcp/sse` |
+
+**Streamable HTTP** is the newer, recommended transport. AutoMem serves `/mcp` in stateless mode for broad client compatibility, so clients can treat each request independently and don't need long-lived server-side session continuity.
+
+**SSE** is still supported for backward compatibility with older clients.
+
+Legacy SSE streams remain open while connected, including quiet streams. A
+disconnect removes the session and heartbeat immediately. The bridge also sweeps
+abandoned sessions every five minutes after one hour without a message; this idle
+timeout does not terminate a connected stream.
+
+## Why Use the MCP Bridge?
+
+**Use Case: Cloud AI Platforms**
+
+Most AI platforms (ChatGPT, Claude.ai, ElevenLabs) run in the cloud and can't connect to local MCP servers. The MCP bridge solves this by:
+
+1. Running alongside your AutoMem API on Railway
+2. Exposing MCP tools over HTTPS (Streamable HTTP or SSE)
+3. Allowing cloud platforms to store and recall memories
+
+```mermaid
+flowchart TB
+    subgraph cloud [Cloud AI Platforms]
+        ChatGPT[ChatGPT]
+        ClaudeAI[Claude.ai]
+        ClaudeMobile[Claude Mobile]
+        ElevenLabs[ElevenLabs Agents]
+    end
+
+    subgraph railway [Railway Deployment]
+        MCPBridge[MCP Bridge<br/>Streamable HTTP<br/>Port 8080]
+
+        subgraph automem [AutoMem Service]
+            API[Memory Service API<br/>Port 8001]
+
+            subgraph storage [Storage]
+                FalkorDB[(FalkorDB)]
+                Qdrant[(Qdrant)]
+            end
+        end
+    end
+
+    subgraph local [Local Development]
+        Cursor[Cursor IDE]
+        ClaudeDesktop[Claude Desktop]
+        ClaudeCode[Claude Code]
+        LocalMCP[Local MCP Package<br/>@verygoodplugins/mcp-automem]
+    end
+
+    ChatGPT -->|Streamable HTTP| MCPBridge
+    ClaudeAI -->|Streamable HTTP| MCPBridge
+    ClaudeMobile -->|Streamable HTTP| MCPBridge
+    ElevenLabs -->|Streamable HTTP| MCPBridge
+
+    MCPBridge -->|Internal networking<br/>railway.internal:8001| API
+
+    API --> FalkorDB
+    API --> Qdrant
+
+    Cursor -.->|Direct connection| LocalMCP
+    ClaudeDesktop -.->|Optional local package| LocalMCP
+    ClaudeCode -.->|Direct connection| LocalMCP
+    LocalMCP -.->|HTTP| API
+```
+
+**When to Deploy It:**
+
+| Platform              | Needs MCP Bridge? | Notes                           |
+| --------------------- | ----------------- | ------------------------------- |
+| **ChatGPT**           | ✅ Yes            | Web/mobile, uses MCP connectors |
+| **Claude.ai**         | ✅ Yes            | Web interface MCP support       |
+| **Claude Mobile**     | ✅ Yes            | iOS/Android app                 |
+| **ElevenLabs Agents** | ✅ Yes            | Voice AI with tool calling      |
+| **Cursor IDE**        | ❌ No             | Use local `mcp-automem` package |
+| **Claude Desktop**    | ✅ Usually yes    | Recommended if you want the same connector enabled in Desktop, Claude.ai, and iOS |
+| **Claude Code**       | ❌ No             | Use local `mcp-automem` package |
+
+**If you only use Cursor or Claude Code**, you usually don't need the MCP bridge. Claude Desktop can still use the local MCP package, but disabling the remote connector there may also disable it for Claude.ai/iOS because Anthropic now syncs connector state across clients.
+
+Local install:
+
+```bash
+npx @verygoodplugins/mcp-automem cursor  # or 'claude' or 'claude-code'
+```
+
+---
+
+## Deploy MCP Bridge on Railway
+
+### Already Using the Template?
+
+The AutoMem Railway template **includes mcp-sse-server by default**. After deploying:
+
+1. Go to Railway Dashboard → `mcp-sse-server` service
+2. Click Settings → Networking → **Generate Domain**
+3. Your MCP URL is: `https://your-mcp-bridge.up.railway.app/mcp` (Streamable HTTP)
+   - Legacy SSE: `https://your-mcp-bridge.up.railway.app/mcp/sse`
+
+Skip to [Client Setup](#client-setup) below.
+
+### Adding MCP Bridge to an Existing Deployment
+
+If you deployed before the MCP bridge was included, add it manually:
+
+1. **Create New Service**
+
+   - In your Railway project, click `+ New Service`
+   - Select `GitHub Repo` → `verygoodplugins/automem`
+
+2. **Configure Root Directory**
+
+   - Settings → **Root Directory**: `mcp-sse-server`
+   - Railway will auto-detect the Dockerfile
+
+3. **Set Environment Variables**
+
+   ```bash
+   PORT=8080
+   AUTOMEM_API_URL=http://automem.railway.internal:8001
+   AUTOMEM_API_TOKEN=<copy from automem>
+   ```
+
+   > **Important**: Replace `automem` with your actual AutoMem API service name if different. Check with: `railway variables --service <your-api-service> | grep RAILWAY_PRIVATE_DOMAIN`
+
+4. **Configure Health Check**
+
+   - Path: `/health`
+   - Timeout: 100s
+
+5. **Generate Public Domain**
+   - Settings → Networking → Generate Domain
+   - Save your URL: `https://your-mcp-bridge.up.railway.app`
+
+---
+
+## Supported Tools
+
+The MCP bridge exposes these MCP tools:
+
+| Tool                    | Description                                 |
+| ----------------------- | ------------------------------------------- |
+| `store_memory`          | Store a new memory with tags and importance |
+| `recall_memory`         | Semantic search across memories             |
+| `associate_memories`    | Create relationships between memories       |
+| `update_memory`         | Modify existing memory content or metadata  |
+| `delete_memory`         | Remove a memory                             |
+| `check_database_health` | Verify FalkorDB/Qdrant connectivity         |
+
+## Recall Ordering
+
+`associate_memories` accepts either a single association:
+
+```json
+{
+  "memory1_id": "...",
+  "memory2_id": "...",
+  "type": "RELATES_TO",
+  "strength": 0.9
+}
+```
+
+or a batch of up to 500 associations:
+
+```json
+{
+  "associations": [
+    {
+      "memory1_id": "...",
+      "memory2_id": "...",
+      "type": "RELATES_TO",
+      "strength": 0.9
+    }
+  ]
+}
+```
+
+Batch calls return a concise summary and item-indexed failures when only some associations succeed. `associate_memories` accepts only the 11 authorable semantic relationship types. Auto-generated labels such as `SIMILAR_TO`, `PRECEDED_BY`, and `DISCOVERED` remain readable on recall surfaces but are not exposed as authoring choices in the MCP schema.
+
+`recall_memory` defaults to relevance ranking (`sort: "score"`). For chronological recaps (e.g. “what happened since X”), set:
+
+- `sort: "time_desc"` / `sort: "time_asc"` to order within a time window
+- `sort: "updated_desc"` / `sort: "updated_asc"` for the same ordering, named explicitly for updates
+
+Example:
+
+```json
+{ "time_query": "last 7 days", "sort": "time_desc" }
+```
+
+## Recall Modes
+
+The bridge's `recall_memory` matches the stdio package
+(`@verygoodplugins/mcp-automem`) argument for argument. Which arguments you
+pass decides the mode:
+
+- **ID fetch:** `{ "memory_id": "<uuid>" }` returns that one memory in full
+  and ignores every other argument. An unknown id is an empty result. An id
+  that is not a UUID is an error.
+- **Tag enumeration:** `{ "tags": ["my-project"], "exhaustive": true, "limit": 50, "offset": 0 }`
+  lists every memory carrying any of the tags, using exact matching, and
+  returns `has_more` and `next_offset` for paging. Follow `next_offset` when
+  a response is budget-trimmed. Query, time, exclusion, expansion, state,
+  score and sort arguments are rejected in this mode. The context hints
+  (`context`, `language`, `active_path`, `context_tags`, `context_types`,
+  `priority_ids`) and `per_query_limit` are also rejected, as in stdio 0.17.0.
+- **Ranked recall (default):** hybrid search. These arguments pass through to
+  `GET /recall`:
+  - `exclude_tags`
+  - `current_only` / `state_mode` / `state_debug`
+  - `recency_bias`
+  - `min_score` and `adaptive_floor`
+  - `expand_respect_tags`
+
+The `text`, `items` and `detailed` formats show 400-character previews and stay
+within a response budget of 18,000 estimated tokens by default
+(`AUTOMEM_RECALL_TOKEN_BUDGET`). Fetch the full record by `memory_id`. Every
+successful call also returns `structuredContent`. See
+[MCP_TRANSPORT_PARITY.md](MCP_TRANSPORT_PARITY.md) for how the two transports
+are kept in step.
+
+---
+
+## Client Setup
+
+### Endpoints
+
+| Transport                     | Endpoint                            | Purpose                                              |
+| ----------------------------- | ----------------------------------- | ---------------------------------------------------- |
+| Streamable HTTP (Recommended) | `POST /mcp`                         | Stateless JSON-RPC over HTTP                         |
+| Streamable HTTP (Recommended) | `GET /mcp`                          | Optional SSE stream when `Accept: text/event-stream` |
+| SSE (Deprecated)              | `GET /mcp/sse`                      | SSE stream (server → client)                         |
+| SSE (Deprecated)              | `POST /mcp/messages?sessionId=<id>` | Client → server JSON-RPC                             |
+| Shared                        | `GET /health`                       | Health probe                                         |
+
+```mermaid
+sequenceDiagram
+    participant Client as AI Platform<br/>(ChatGPT/Claude)
+    participant MCP as MCP Bridge<br/>Streamable HTTP
+    participant API as AutoMem API<br/>automem
+    participant DB as FalkorDB/Qdrant
+
+    Note over Client,DB: Connection Establishment
+    Client->>MCP: POST /mcp (initialize)
+    MCP-->>Client: 200 OK + capabilities
+
+    Note over Client,DB: Memory Operations
+    Client->>MCP: POST /mcp<br/>tool: store_memory
+    MCP->>API: POST /memory<br/>Authorization: Bearer xxx
+    API->>DB: Store in graph + vectors
+    DB-->>API: Success
+    API-->>MCP: 201 Created
+    MCP-->>Client: JSON-RPC response<br/>{status: success, memory_id: ...}
+
+    Note over Client,DB: Recall Operation
+    Client->>MCP: POST /mcp<br/>tool: recall_memory
+    MCP->>API: GET /recall?query=...
+    API->>DB: Hybrid search
+    DB-->>API: Results
+    API-->>MCP: 200 OK
+    MCP-->>Client: JSON-RPC response<br/>{results: [...]}
+
+    Note over Client,DB: Optional SSE Stream
+    Client->>MCP: GET /mcp (Accept: text/event-stream)
+    MCP-->>Client: SSE stream for server notifications
+```
+
+### Authentication
+
+### Stateless Behavior
+
+`/mcp` does not rely on server-side Streamable HTTP sessions. The bridge does not return an `Mcp-Session-Id` from initialize, and any incoming session header on `/mcp` is ignored. This matches current remote-client behavior more reliably across ChatGPT, Claude, and other hosted MCP clients.
+
+**Header-based** (preferred when supported):
+
+```text
+Authorization: Bearer <AUTOMEM_API_TOKEN>
+```
+
+**URL-based** (for platforms that only support OAuth):
+
+```url
+https://your-mcp-bridge.up.railway.app/mcp/sse?api_token=<AUTOMEM_API_TOKEN>
+```
+
+> Note: `?api_key=` also works as an alias
+
+---
+
+### ChatGPT Setup
+
+ChatGPT supports MCP connectors. Use Streamable HTTP if supported, otherwise fall back to SSE:
+
+1. **Enable Developer Mode**
+
+   - Settings → Connectors → Advanced → Enable Developer Mode
+
+2. **Add MCP Server**
+
+   - Click `+ Add Server`
+   - **Server URL** (try Streamable HTTP first):
+     ```url
+     https://your-mcp-bridge.up.railway.app/mcp?api_token=YOUR_TOKEN
+     ```
+   - **Fallback** (if Streamable HTTP not supported):
+     ```url
+     https://your-mcp-bridge.up.railway.app/mcp/sse?api_token=YOUR_TOKEN
+     ```
+
+3. **Test It**
+   - Ask ChatGPT: "Store a memory: I prefer dark mode in all applications"
+   - Then: "What are my preferences?"
+
+---
+
+### Claude.ai Setup (Web)
+
+1. Go to Settings → MCP Servers (or similar)
+2. **Server URL** (Streamable HTTP):
+   ```url
+   https://your-mcp-bridge.up.railway.app/mcp?api_token=YOUR_TOKEN
+   ```
+   Or SSE (if needed):
+   ```url
+   https://your-mcp-bridge.up.railway.app/mcp/sse?api_token=YOUR_TOKEN
+   ```
+
+---
+
+### Claude Mobile Setup (iOS/Android)
+
+1. Open Settings → MCP Servers
+2. **Server URL**:
+   ```url
+   https://your-mcp-bridge.up.railway.app/mcp?api_token=YOUR_TOKEN
+   ```
+
+---
+
+### ElevenLabs Agents Setup
+
+ElevenLabs supports custom headers, giving you two options:
+
+**Option 1: Custom Header (Recommended)**
+
+- **Server URL**: `https://your-mcp-bridge.up.railway.app/mcp/sse`
+- **Custom Header**:
+  - Name: `Authorization`
+  - Value: `Bearer YOUR_TOKEN`
+
+**Option 2: URL Parameter**
+
+- **Server URL**: `https://your-mcp-bridge.up.railway.app/mcp/sse?api_token=YOUR_TOKEN`
+
+**Using with Voice Agents:**
+ElevenLabs agents can use AutoMem to:
+
+- Remember user preferences across conversations
+- Recall context from previous sessions
+- Store important decisions and facts
+
+Example agent prompt:
+
+```text
+You have access to a persistent memory system. Use store_memory to save
+important user preferences, decisions, and facts. Use recall_memory to
+retrieve relevant context before answering questions.
+```
+
+---
+
+## Troubleshooting
+
+### "fetch failed" or Connection Refused
+
+1. **Check the AutoMem API service has `PORT=8001`**
+
+   - Most common cause. Without it, Flask defaults to port 5000.
+   - Fix: Add `PORT=8001` to the AutoMem API service environment variables.
+
+2. **Verify AUTOMEM_API_URL**
+
+   - Should match your AutoMem API service's internal domain:
+     ```bash
+     AUTOMEM_API_URL=http://automem.railway.internal:8001
+     ```
+   - Check actual domain: `railway variables --service automem | grep RAILWAY_PRIVATE_DOMAIN`
+
+3. **Check SSE service logs**
+
+   ```bash
+   railway logs --service automem-mcp-sse
+   ```
+
+4. **Fallback: Use public URL**
+   - If internal networking fails, use the public URL (slower but works):
+     ```bash
+     AUTOMEM_API_URL=https://your-automem.up.railway.app
+     ```
+
+### Connection Drops
+
+**Streamable HTTP (recommended):**
+
+- `/mcp` is stateless, so reconnects do not depend on a server-side session surviving
+- Clients can retry initialize or tool calls directly without waiting for session recovery
+- If a client sends a stale `Mcp-Session-Id`, the bridge ignores it on `/mcp`
+
+**SSE (deprecated):**
+
+- Keepalive heartbeats are sent every 20 seconds
+- Some proxies/firewalls may still timeout; check platform-specific limits
+- ElevenLabs has a 30-second idle timeout; ensure heartbeats are reaching client
+
+### Authentication Errors
+
+- **401 Unauthorized**: Check token matches `AUTOMEM_API_TOKEN` in the AutoMem API service
+- **URL tokens in logs**: Normal for URL-based auth; use header auth if security is critical
+
+---
+
+## Security Notes
+
+- **No-token fallback (important)**: the bridge forwards the *client's* token upstream, but when the client sends none it falls back to the bridge service's own `AUTOMEM_API_TOKEN` env var. So **if that env var is set, the bridge is reachable with no client token at all** — the URL alone becomes the credential. A *wrong* client token is still rejected upstream; only a *missing* one triggers the fallback. To **require** a client token (`Authorization: Bearer`, `X-API-Key`, or `?api_token=`), **remove `AUTOMEM_API_TOKEN` from the mcp-sse-server service** — anonymous requests then get `401`. Trade-off: the `/health` upstream probe shares that env var, so removing it makes `/health` report `degraded`/`upstream: unconfigured` (cosmetic — liveness still returns `200` and tokened MCP calls work). A cleaner long-term fix is a dedicated probe token separate from the forwarded client token.
+- **URL tokens appear in logs**: If using `?api_token=`, be aware tokens may be logged by proxies
+- **Internal networking**: Railway private domains are only accessible within your project
+- **Rate limiting**: Consider adding a reverse proxy with rate limiting for production
+- **Token rotation**: Rotate `AUTOMEM_API_TOKEN` periodically via Railway dashboard
