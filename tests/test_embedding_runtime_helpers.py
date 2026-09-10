@@ -19,210 +19,288 @@ logger = logging.getLogger("test_embedding_runtime_helpers")
 
 
 def _placeholder(content: str) -> list:
-    pass  # TODO: implement
+    """Sentinel placeholder vector, distinguishable from real embeddings."""
+    return [-1.0] * DIM
 
 
 def _real_vector(content: str) -> list:
-    pass  # TODO: implement
+    """Deterministic per-content 'real' embedding."""
+    return [float(len(content))] * DIM
 
 
 class _State:
-    pass  # TODO: implement
     def __init__(self, provider):
-        pass  # TODO: implement
+        self.embedding_provider = provider
+        self.effective_vector_size = DIM
 
 
 def _run(contents, provider, caplog, *, allow_placeholder_fallback=True):
-    pass  # TODO: implement
+    with caplog.at_level(logging.DEBUG):
+        return generate_real_embeddings_batch(
+            contents,
+            init_embedding_provider=lambda: None,
+            state=_State(provider),
+            logger=logger,
+            placeholder_embedding=_placeholder,
+            allow_placeholder_fallback=allow_placeholder_fallback,
+        )
 
 
 def _warning_messages(caplog):
-    pass  # TODO: implement
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 # ==================== Happy path ====================
 
 
 def test_batch_success_returns_batch_result(caplog):
-    pass  # TODO: implement
+    """When the provider batch call succeeds, its result is returned as-is."""
 
     class Provider:
-        pass  # TODO: implement
+        single_calls = 0
 
         def provider_name(self):
-            pass  # TODO: implement
+            return "voyage:voyage-4"
 
         def generate_embeddings_batch(self, contents):
-            pass  # TODO: implement
+            return [_real_vector(c) for c in contents]
 
         def generate_embedding(self, content):
-            pass  # TODO: implement
+            Provider.single_calls += 1
+            return _real_vector(content)
 
+    contents = ["alpha", "bravo!", "charlie7"]
+    result = _run(contents, Provider(), caplog)
 
+    assert result == [_real_vector(c) for c in contents]
+    assert Provider.single_calls == 0, "per-item fallback should not run on success"
+    assert _warning_messages(caplog) == []
 
 
 # ==================== Batch failure, singles work ====================
 
 
 def test_batch_raises_single_works_uses_real_embeddings(caplog):
-    pass  # TODO: implement
+    """Batch call raises (Voyage multi-input hang): fall back to per-item
+    real embeddings — never placeholders."""
 
     class Provider:
-        pass  # TODO: implement
         def provider_name(self):
-            pass  # TODO: implement
+            return "voyage:voyage-4"
 
         def generate_embeddings_batch(self, contents):
-            pass  # TODO: implement
+            raise RuntimeError("read timeout")
 
         def generate_embedding(self, content):
-            pass  # TODO: implement
+            return _real_vector(content)
 
+    contents = ["alpha", "bravo!", "charlie7"]
+    result = _run(contents, Provider(), caplog)
 
+    assert len(result) == len(contents)
+    assert result == [_real_vector(c) for c in contents]
+    assert _placeholder("x") not in result, "no item should fall back to placeholder"
 
+    warnings = _warning_messages(caplog)
+    assert len(warnings) == 1, f"expected exactly one warning, got: {warnings}"
+    assert "voyage:voyage-4" in warnings[0]
+    assert "read timeout" in warnings[0]
 
 
 def test_batch_wrong_count_single_works_uses_real_embeddings(caplog):
-    pass  # TODO: implement
+    """Batch returns the wrong number of vectors: fall back to per-item
+    real embeddings."""
 
     class Provider:
-        pass  # TODO: implement
         def provider_name(self):
-            pass  # TODO: implement
+            return "voyage:voyage-4"
 
         def generate_embeddings_batch(self, contents):
-            pass  # TODO: implement
+            return [_real_vector(contents[0])]  # 1 vector for 3 contents
 
         def generate_embedding(self, content):
-            pass  # TODO: implement
+            return _real_vector(content)
 
+    contents = ["alpha", "bravo!", "charlie7"]
+    result = _run(contents, Provider(), caplog)
 
+    assert len(result) == len(contents)
+    assert result == [_real_vector(c) for c in contents]
+    assert _placeholder("x") not in result
 
+    warnings = _warning_messages(caplog)
+    assert len(warnings) == 1, f"expected exactly one warning, got: {warnings}"
+    assert "voyage:voyage-4" in warnings[0]
 
 
 def test_batch_wrong_dims_single_works_uses_real_embeddings(caplog):
-    pass  # TODO: implement
+    """Batch returns vectors with wrong dimensions: fall back to per-item
+    real embeddings."""
 
     class Provider:
-        pass  # TODO: implement
         def provider_name(self):
-            pass  # TODO: implement
+            return "voyage:voyage-4"
 
         def generate_embeddings_batch(self, contents):
-            pass  # TODO: implement
+            return [[0.5] * (DIM + 1) for _ in contents]
 
         def generate_embedding(self, content):
-            pass  # TODO: implement
+            return _real_vector(content)
 
+    contents = ["alpha", "bravo!"]
+    result = _run(contents, Provider(), caplog)
 
+    assert result == [_real_vector(c) for c in contents]
+    assert _placeholder("x") not in result
 
 
 def test_missing_provider_name_still_falls_back_to_single_embeddings(caplog):
-    pass  # TODO: implement
+    """A custom provider without provider_name() should not bypass fallback."""
 
     class Provider:
-        pass  # TODO: implement
         def generate_embeddings_batch(self, contents):
-            pass  # TODO: implement
+            raise RuntimeError("read timeout")
 
         def generate_embedding(self, content):
-            pass  # TODO: implement
+            return _real_vector(content)
 
+    contents = ["alpha", "bravo!"]
+    result = _run(contents, Provider(), caplog)
 
+    assert result == [_real_vector(c) for c in contents]
+    warnings = _warning_messages(caplog)
+    assert len(warnings) == 1, f"expected exactly one warning, got: {warnings}"
+    assert "Provider" in warnings[0]
+    assert "read timeout" in warnings[0]
 
 
 # ==================== Batch and singles both fail ====================
 
 
 def test_batch_and_single_fail_uses_placeholders_with_summary_warning(caplog):
-    pass  # TODO: implement
+    """Only when both batch AND per-item calls fail do we use placeholders,
+    and we must log a loud summary warning about semantic-search invisibility."""
 
     class Provider:
-        pass  # TODO: implement
         def provider_name(self):
-            pass  # TODO: implement
+            return "voyage:voyage-4"
 
         def generate_embeddings_batch(self, contents):
-            pass  # TODO: implement
+            raise RuntimeError("read timeout")
 
         def generate_embedding(self, content):
-            pass  # TODO: implement
+            raise RuntimeError("connection refused")
 
+    contents = ["alpha", "bravo!", "charlie7"]
+    result = _run(contents, Provider(), caplog)
 
+    assert result == [_placeholder(c) for c in contents]
 
+    warnings = _warning_messages(caplog)
+    summary = [w for w in warnings if "placeholder" in w]
+    assert summary, f"expected a placeholder summary warning, got: {warnings}"
+    assert "3/3" in summary[0]
+    assert "invisible to semantic search" in summary[0]
 
 
 def test_partial_single_failure_only_failed_items_get_placeholders(caplog):
-    pass  # TODO: implement
+    """Items whose individual call fails get placeholders; the rest keep
+    real embeddings. Summary warning counts only the fallbacks."""
 
     class Provider:
-        pass  # TODO: implement
         def provider_name(self):
-            pass  # TODO: implement
+            return "voyage:voyage-4"
 
         def generate_embeddings_batch(self, contents):
-            pass  # TODO: implement
+            raise RuntimeError("read timeout")
 
         def generate_embedding(self, content):
-            pass  # TODO: implement
+            if content == "bravo!":
+                raise RuntimeError("transient failure")
+            return _real_vector(content)
 
+    contents = ["alpha", "bravo!", "charlie7"]
+    result = _run(contents, Provider(), caplog)
 
+    assert result == [
+        _real_vector("alpha"),
+        _placeholder("bravo!"),
+        _real_vector("charlie7"),
+    ]
 
+    summary = [w for w in _warning_messages(caplog) if "placeholder" in w]
+    assert summary, "expected a placeholder summary warning"
+    assert "1/3" in summary[0]
+    assert "invisible to semantic search" in summary[0]
 
 
 def test_strict_mode_raises_instead_of_using_placeholder_fallback(caplog):
-    pass  # TODO: implement
+    """Repair callers can reject placeholder fallback when real embeddings fail."""
 
     class Provider:
-        pass  # TODO: implement
         def provider_name(self):
-            pass  # TODO: implement
+            return "voyage:voyage-4"
 
         def generate_embeddings_batch(self, contents):
-            pass  # TODO: implement
+            raise RuntimeError("read timeout")
 
         def generate_embedding(self, content):
-            pass  # TODO: implement
+            raise RuntimeError("connection refused")
 
+    with pytest.raises(RuntimeError, match="Failed to generate provider embedding"):
+        _run(["alpha"], Provider(), caplog, allow_placeholder_fallback=False)
 
 
 def test_strict_mode_raises_for_placeholder_provider(caplog):
-    pass  # TODO: implement
+    """Repair callers can reject configured placeholder providers."""
 
     class Provider:
-        pass  # TODO: implement
+        batch_calls = 0
 
         def provider_name(self):
-            pass  # TODO: implement
+            return "placeholder"
 
         def generate_embeddings_batch(self, contents):
-            pass  # TODO: implement
+            Provider.batch_calls += 1
+            return [_placeholder(c) for c in contents]
 
         def generate_embedding(self, content):
-            pass  # TODO: implement
+            raise AssertionError("should not be called")
 
+    with pytest.raises(RuntimeError, match="Placeholder embedding provider"):
+        _run(["alpha"], Provider(), caplog, allow_placeholder_fallback=False)
+    assert Provider.batch_calls == 0
 
 
 # ==================== Contract ====================
 
 
 def test_empty_contents_returns_empty_list(caplog):
-    pass  # TODO: implement
     class Provider:
-        pass  # TODO: implement
         def provider_name(self):
-            pass  # TODO: implement
+            return "voyage:voyage-4"
 
         def generate_embeddings_batch(self, contents):
-            pass  # TODO: implement
+            raise AssertionError("should not be called")
 
         def generate_embedding(self, content):
-            pass  # TODO: implement
+            raise AssertionError("should not be called")
 
+    assert _run([], Provider(), caplog) == []
 
 
 def test_no_provider_uses_placeholders(caplog):
-    pass  # TODO: implement
+    """No provider configured at all: placeholders (pre-existing behavior)."""
+    with caplog.at_level(logging.DEBUG):
+        result = generate_real_embeddings_batch(
+            ["alpha", "bravo!"],
+            init_embedding_provider=lambda: None,
+            state=_State(None),
+            logger=logger,
+            placeholder_embedding=_placeholder,
+        )
+    assert result == [_placeholder("alpha"), _placeholder("bravo!")]
 
 
 if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

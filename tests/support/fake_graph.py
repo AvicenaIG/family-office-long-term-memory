@@ -1,0 +1,948 @@
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+
+
+class FakeResult:
+    def __init__(self, rows: List[List[Any]]) -> None:
+        self.result_set = rows
+
+
+class FakeNode:
+    def __init__(self, properties: Dict[str, Any]) -> None:
+        self.properties = properties
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _returns_whole_memory_node(query: str) -> bool:
+    # Match `RETURN m` but not `RETURN m.id`, `RETURN m.content`, etc.
+    return re.search(r"\bRETURN\s+m\b(?![\w.])", query) is not None
+
+
+def _skip_limit(query: str) -> tuple[int, int | None]:
+    match = re.search(r"\bSKIP\s+(\d+)\s+LIMIT\s+(\d+)", query)
+    if not match:
+        return 0, None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _id_range(query: str, alias: str) -> tuple[int, int] | None:
+    """Parse the `id(x) >= lo AND id(x) < hi` window the backup exporter pages with."""
+    match = re.search(
+        rf"id\({alias}\)\s*>=\s*(\d+)\s+AND\s+id\({alias}\)\s*<\s*(\d+)", " ".join(query.split())
+    )
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _single_id(query: str, alias: str) -> int | None:
+    match = re.search(rf"id\({alias}\)\s*=\s*(\d+)", " ".join(query.split()))
+    return int(match.group(1)) if match else None
+
+
+def _memory_type_allowed(memory: Dict[str, Any], excluded_types: List[str]) -> bool:
+    if not excluded_types:
+        return True
+    memory_type = str(memory.get("type") or "")
+    return memory_type not in {str(value) for value in excluded_types}
+
+
+class FakeGraph:
+    """Shared fake FalkorDB graph used across unit tests.
+
+    This merges behaviors that previously lived in DummyGraph, MockGraph,
+    and multiple FakeGraph variants.
+    """
+
+    def __init__(self, *, seed_enrichment_fixture: bool = False) -> None:
+        self.queries: List[tuple[str, Dict[str, Any]]] = []
+        self.query_kwargs: List[Dict[str, Any]] = []
+
+        # Set to mimic FalkorDB's RESULTSET_SIZE cap (silent truncation).
+        self.resultset_cap: int | None = None
+
+        # Generic memory storage + associations
+        self.memories: Dict[str, Dict[str, Any]] = {}
+        self.nodes: set[str] = set()
+        self.relationships: List[Dict[str, Any]] = []
+        self.association_error_types: set[str] = set()
+
+        # Enrichment tracking
+        self.temporal_calls: List[Dict[str, Any]] = []
+        self.pattern_calls: List[Dict[str, Any]] = []
+        self.exemplifies_calls: List[Dict[str, Any]] = []
+        self.update_calls: List[Dict[str, Any]] = []
+        self.temporal_related_ids: List[str] = []
+        self.pattern_source_rows: List[List[Any]] = []
+
+        # Consolidation fixtures + tracking
+        self.relationship_counts: Dict[str, int] = {}
+        self.sample_rows: List[List[Any]] = []
+        self.existing_pairs: set[frozenset[str]] = set()
+        self.cluster_rows: List[List[Any]] = []
+        self.decay_rows: List[List[Any]] = []
+        self.forgetting_rows: List[List[Any]] = []
+        self.deleted: List[str] = []
+        self.archived: List[tuple[str, float]] = []
+        self.updated_scores: List[tuple[str, float]] = []
+
+        if seed_enrichment_fixture:
+            self.memories["mem-1"] = {
+                "id": "mem-1",
+                "content": 'Met with Alice about SuperWhisper deployment on project "Launchpad".',
+                "tags": ["meeting"],
+                "metadata": {},
+                "processed": False,
+                "summary": None,
+                "importance": 0.5,
+                "confidence": 0.7,
+                "type": "Memory",
+                "timestamp": _utc_now(),
+            }
+            self.temporal_related_ids = ["mem-older"]
+            self.pattern_source_rows = [
+                ["mem-a", "Pattern insight about automation"],
+                ["mem-b", "Another automation pattern emerges"],
+                ["mem-c", "Automation habit noted"],
+            ]
+
+    def _backup_node_rows(self) -> List[List[Any]]:
+        return [
+            [index, ["Memory"], dict(memory)]
+            for index, (_memory_id, memory) in enumerate(sorted(self.memories.items()))
+        ]
+
+    def _backup_relationship_rows(self) -> List[List[Any]]:
+        backup_ids = {memory_id: index for index, memory_id in enumerate(sorted(self.memories))}
+        rows: List[List[Any]] = []
+        for rel in self.relationships:
+            source_id = str(rel.get("id1") or "")
+            target_id = str(rel.get("id2") or "")
+            if source_id not in backup_ids or target_id not in backup_ids:
+                continue
+            props = {key: value for key, value in rel.items() if key not in {"id1", "id2", "type"}}
+            rows.append(
+                [
+                    backup_ids[source_id],
+                    str(rel.get("type") or "RELATES_TO"),
+                    backup_ids[target_id],
+                    props,
+                ]
+            )
+        return sorted(rows, key=lambda row: row[0])
+
+    def _apply_result_limits(self, rows: List[List[Any]], query: str) -> List[List[Any]]:
+        """Apply SKIP/LIMIT, then RESULTSET_SIZE truncation the way the server does: silently."""
+        skip, limit = _skip_limit(query)
+        rows = rows[skip : None if limit is None else skip + limit]
+        if self.resultset_cap is not None:
+            rows = rows[: self.resultset_cap]
+        return rows
+
+    def execute_command(self, *args: Any) -> Any:
+        if args[:3] == ("GRAPH.CONFIG", "GET", "RESULTSET_SIZE"):
+            return ["RESULTSET_SIZE", self.resultset_cap or 0]
+        raise NotImplementedError(f"FakeGraph.execute_command{args}")
+
+    def query(self, query: str, params: Dict[str, Any] | None = None, **kwargs: Any) -> FakeResult:
+        self.query_kwargs.append(dict(kwargs))
+        params = params or {}
+        self.queries.append((query, params))
+
+        # Consolidation engine query patterns
+        if "COUNT(DISTINCT r)" in query:
+            memory_id = params.get("id")
+            return FakeResult([[self.relationship_counts.get(memory_id, 0)]])
+
+        if "RETURN COUNT(r) as count" in query and "$id1" in query:
+            key = frozenset((params["id1"], params["id2"]))
+            return FakeResult([[1 if key in self.existing_pairs else 0]])
+
+        if "ORDER BY rand()" in query and "LIMIT $limit" in query:
+            limit = params.get("limit")
+            rows = self.sample_rows if limit is None else self.sample_rows[:limit]
+            return FakeResult(rows)
+
+        if "WHERE m.embeddings IS NOT NULL" in query:
+            return FakeResult(self.cluster_rows)
+
+        if "m.relevance_score as old_score" in query:
+            return FakeResult(self.decay_rows)
+
+        if "m.relevance_score as score" in query and "m.last_accessed as last_accessed" in query:
+            return FakeResult(self.forgetting_rows)
+
+        if "SET m.archived = true" in query:
+            memory_id = str(params.get("id") or "")
+            score = float(params.get("score") or 0.0)
+            self.archived.append((memory_id, score))
+            return FakeResult([])
+
+        if "SET m.relevance_score = $score" in query:
+            memory_id = str(params.get("id") or "")
+            score = float(params.get("score") or 0.0)
+            self.updated_scores.append((memory_id, score))
+            memory = self.memories.get(memory_id)
+            if memory is not None:
+                memory["relevance_score"] = score
+            return FakeResult([])
+
+        if "MATCH (m:Memory)" in query and "RETURN COUNT(m)" in query:
+            excluded_types = params.get("excluded_types") or []
+            count = sum(
+                1
+                for memory in self.memories.values()
+                if _memory_type_allowed(memory, excluded_types)
+            )
+            return FakeResult([[count]])
+
+        # JIT canonical enrichment state check
+        if "MATCH (m:Memory {id: $id}) RETURN m.enriched, m.processed" in query:
+            memory_id = params.get("id")
+            memory = self.memories.get(memory_id)
+            if memory is None:
+                return FakeResult([])
+            return FakeResult([[bool(memory.get("enriched")), bool(memory.get("processed"))]])
+
+        if "SET m.metadata" in query and (
+            "m.enriched = true" in query or "m.enriched = $enriched" in query
+        ):
+            memory_id = str(params.get("id") or "")
+            memory = self.memories.get(memory_id)
+            if "expected_content" in params and memory is not None:
+                for field in ("content", "tags", "metadata", "summary"):
+                    default = [] if field == "tags" else ""
+                    if (memory.get(field) or default) != params[f"expected_{field}"]:
+                        return FakeResult([])
+                if (
+                    "expected_timestamp" in params
+                    and (memory.get("timestamp") or "") != params["expected_timestamp"]
+                ):
+                    return FakeResult([])
+            if any(key.startswith("enrichment_") for key in params):
+                if "MERGE (m1)-[r:PRECEDED_BY]" in query:
+                    self.temporal_calls.append(dict(params))
+                if "MERGE (p:Pattern" in query:
+                    self.pattern_calls.append(dict(params))
+                if "MERGE (m)-[r:EXEMPLIFIES]" in query:
+                    self.exemplifies_calls.append(dict(params))
+            self.update_calls.append(dict(params))
+            if memory is not None:
+                memory.update(
+                    {
+                        "metadata": params.get("metadata", memory.get("metadata", {})),
+                        "tags": params.get("tags", memory.get("tags", [])),
+                        "tag_prefixes": params.get("tag_prefixes", memory.get("tag_prefixes", [])),
+                        "summary": params.get("summary", memory.get("summary")),
+                        "enriched": params.get("enriched", True),
+                        "processed": (
+                            True
+                            if "m.processed = true" in query
+                            else (
+                                False
+                                if "m.processed = false" in query
+                                else memory.get("processed", False)
+                            )
+                        ),
+                        "enriched_at": params.get("enriched_at", memory.get("enriched_at")),
+                    }
+                )
+            return (
+                FakeResult([[FakeNode(memory)]])
+                if "RETURN m" in query and memory is not None
+                else FakeResult([])
+            )
+
+        # Enrichment patterns
+        if "RETURN m2.id" in query and "PRECEDED_BY" not in query:
+            return FakeResult([[memory_id] for memory_id in self.temporal_related_ids])
+
+        if "MERGE (m1)-[r:PRECEDED_BY]" in query:
+            self.temporal_calls.append(dict(params))
+            return FakeResult([])
+
+        if (
+            "MATCH (m:Memory)" in query
+            and "m.type = $type" in query
+            and "RETURN m.id, m.content" in query
+        ):
+            return FakeResult(self.pattern_source_rows)
+
+        if "MERGE (p:Pattern" in query:
+            self.pattern_calls.append(dict(params))
+            if "MERGE (m)-[r:EXEMPLIFIES]" in query:
+                self.exemplifies_calls.append(dict(params))
+            return FakeResult([])
+
+        if "MERGE (m)-[r:EXEMPLIFIES]" in query:
+            self.exemplifies_calls.append(dict(params))
+            return FakeResult([])
+
+        # Full graph backup export
+        if "RETURN max(id(n))" in query:
+            node_rows = self._backup_node_rows()
+            return FakeResult([[node_rows[-1][0] if node_rows else None]])
+
+        if "RETURN count(n)" in query:
+            return FakeResult([[len(self._backup_node_rows())]])
+
+        if "RETURN count(r)" in query:
+            return FakeResult([[len(self._backup_relationship_rows())]])
+
+        if "MATCH (n)" in query and "id(n) as id" in query and "properties(n) as props" in query:
+            rows = self._backup_node_rows()
+            id_range = _id_range(query, "n")
+            if id_range:
+                rows = [row for row in rows if id_range[0] <= row[0] < id_range[1]]
+            return FakeResult(self._apply_result_limits(rows, query))
+
+        if (
+            "MATCH (a)-[r]->(b)" in query
+            and "id(a) as source_id" in query
+            and "properties(r) as props" in query
+        ):
+            rows = self._backup_relationship_rows()
+            id_range = _id_range(query, "a")
+            single_id = _single_id(query, "a")
+            if id_range:
+                rows = [row for row in rows if id_range[0] <= row[0] < id_range[1]]
+            elif single_id is not None:
+                rows = [row for row in rows if row[0] == single_id]
+            return FakeResult(self._apply_result_limits(rows, query))
+
+        # Batch memory create/upsert
+        if "UNWIND $memories AS m" in query and "MERGE (node:Memory {id: m.id})" in query:
+            rows = []
+            for memory in params.get("memories") or []:
+                memory_id = str(memory.get("id") or "")
+                if not memory_id:
+                    continue
+                self.nodes.add(memory_id)
+                existing = self.memories.get(memory_id, {})
+                self.memories[memory_id] = {
+                    "id": memory_id,
+                    "content": memory.get("content", existing.get("content", "")),
+                    "tags": memory.get("tags", existing.get("tags", [])),
+                    "tag_prefixes": memory.get("tag_prefixes", existing.get("tag_prefixes", [])),
+                    "importance": memory.get("importance", existing.get("importance", 0.5)),
+                    "type": memory.get("type", existing.get("type", "Memory")),
+                    "timestamp": memory.get("timestamp", existing.get("timestamp", _utc_now())),
+                    "metadata": memory.get("metadata", existing.get("metadata", "{}")),
+                    "updated_at": memory.get("updated_at", existing.get("updated_at")),
+                    "last_accessed": memory.get("last_accessed", existing.get("last_accessed")),
+                    "t_valid": memory.get("t_valid", existing.get("t_valid")),
+                    "t_invalid": memory.get("t_invalid", existing.get("t_invalid")),
+                    "confidence": memory.get("confidence", existing.get("confidence", 1.0)),
+                    "summary": memory.get("summary", existing.get("summary")),
+                    "processed": memory.get("processed", existing.get("processed", False)),
+                    "enriched": memory.get("enriched", existing.get("enriched", False)),
+                    "enriched_at": memory.get("enriched_at", existing.get("enriched_at")),
+                }
+                rows.append([memory_id])
+            return FakeResult(rows)
+
+        # Memory create/upsert
+        if "MERGE (m:Memory {id:" in query or "CREATE (m:Memory {id:" in query:
+            memory_id = str(params["id"])
+            self.nodes.add(memory_id)
+            existing = self.memories.get(memory_id, {})
+            self.memories[memory_id] = {
+                "id": memory_id,
+                "content": params.get("content", existing.get("content", "")),
+                "tags": params.get("tags", existing.get("tags", [])),
+                "tag_prefixes": params.get("tag_prefixes", existing.get("tag_prefixes", [])),
+                "importance": params.get("importance", existing.get("importance", 0.5)),
+                "type": params.get("type", existing.get("type", "Memory")),
+                "timestamp": params.get("timestamp", existing.get("timestamp", _utc_now())),
+                "metadata": params.get("metadata", existing.get("metadata", "{}")),
+                "updated_at": params.get("updated_at", existing.get("updated_at")),
+                "last_accessed": params.get("last_accessed", existing.get("last_accessed")),
+                "t_valid": params.get("t_valid", existing.get("t_valid")),
+                "t_invalid": params.get("t_invalid", existing.get("t_invalid")),
+                "confidence": params.get("confidence", existing.get("confidence", 1.0)),
+                "summary": params.get("summary", existing.get("summary")),
+                "processed": params.get("processed", existing.get("processed", False)),
+                "enriched": params.get("enriched", existing.get("enriched", False)),
+                "enriched_at": params.get("enriched_at", existing.get("enriched_at")),
+            }
+            return FakeResult([[FakeNode(self.memories[memory_id])]])
+
+        # Memory update
+        if "MATCH (m:Memory {id:" in query and "SET m.content" in query:
+            memory_id = str(params["id"])
+            memory = self.memories.get(memory_id)
+            if memory is None:
+                return FakeResult([])
+            memory.update(
+                {
+                    "content": params.get("content", memory.get("content")),
+                    "tags": params.get("tags", memory.get("tags")),
+                    "tag_prefixes": params.get("tag_prefixes", memory.get("tag_prefixes")),
+                    "importance": params.get("importance", memory.get("importance")),
+                    "metadata": params.get("metadata", memory.get("metadata")),
+                    "type": params.get("type", memory.get("type")),
+                    "confidence": params.get("confidence", memory.get("confidence")),
+                    "timestamp": params.get("timestamp", memory.get("timestamp")),
+                    "last_accessed": params.get("last_accessed", memory.get("last_accessed")),
+                    "updated_at": params.get("updated_at", _utc_now()),
+                    "t_valid": params.get("t_valid", memory.get("t_valid")),
+                    "t_invalid": params.get("t_invalid", memory.get("t_invalid")),
+                }
+            )
+            return FakeResult([[FakeNode(memory)]])
+
+        # Memory retrieval by id
+        if (
+            "MATCH (m:Memory {id:" in query
+            and _returns_whole_memory_node(query)
+            and "WHERE" not in query
+        ):
+            memory_id = params.get("id") or params.get("id1") or params.get("id2")
+            memory = self.memories.get(str(memory_id)) if memory_id else None
+            if memory is None:
+                return FakeResult([])
+            return FakeResult([[FakeNode(memory)]])
+
+        # Delete by id (used by API and consolidation)
+        if "MATCH (m:Memory {id:" in query and "DELETE m" in query:
+            memory_id = str(params.get("id") or "")
+            if memory_id:
+                self.deleted.append(memory_id)
+            if memory_id in self.memories:
+                del self.memories[memory_id]
+                return FakeResult([["deleted"]])
+            return FakeResult([])
+
+        if "MATCH (m:Memory) WHERE m.id IN $ids DETACH DELETE m" in query:
+            deleted = []
+            for memory_id in params.get("ids") or []:
+                memory_id = str(memory_id)
+                if memory_id:
+                    self.deleted.append(memory_id)
+                if memory_id in self.memories:
+                    del self.memories[memory_id]
+                    deleted.append(memory_id)
+            return FakeResult([[memory_id] for memory_id in deleted])
+
+        if (
+            "MATCH (m:Memory)" in query
+            and "WHERE m.id IN $ids" in query
+            and "RETURN m.id, m.summary" in query
+        ):
+            rows = []
+            for memory_id in params.get("ids") or []:
+                memory = self.memories.get(str(memory_id))
+                if memory is None or memory.get("summary") is None:
+                    continue
+                rows.append([str(memory_id), memory.get("summary")])
+            return FakeResult(rows)
+
+        if "RETURN m, collect(replacement) AS state_replacements" in query:
+            rows = []
+            for memory_id in params.get("ids") or []:
+                memory = self.memories.get(memory_id)
+                if memory is None:
+                    continue
+                replacements = [
+                    FakeNode(self.memories[rel["id2"]])
+                    for rel in self.relationships
+                    if rel.get("id1") == memory_id
+                    and rel.get("type") in params["types"]
+                    and rel.get("id2") in self.memories
+                ]
+                rows.append([FakeNode(memory), replacements])
+            return FakeResult(rows)
+
+        # Search by exact tag pattern
+        if "MATCH (m:Memory)" in query and "$tag IN m.tags" in query:
+            tag = str(params.get("tag") or "").strip().lower()
+            results = []
+            for memory in self.memories.values():
+                tags = [str(value).strip().lower() for value in (memory.get("tags") or [])]
+                if tag and tag in tags:
+                    results.append([FakeNode(memory)])
+            return FakeResult(results)
+
+        # Search by tags list (/memory/by-tag)
+        if "MATCH (m:Memory)" in query and "toLower(tag) IN $tags" in query:
+            tags = {
+                str(tag).strip().lower()
+                for tag in (params.get("tags") or [])
+                if isinstance(tag, str) and tag.strip()
+            }
+            results = []
+            for memory in self.memories.values():
+                memory_tags = [
+                    str(tag).strip().lower()
+                    for tag in (memory.get("tags") or [])
+                    if isinstance(tag, str) and tag.strip()
+                ]
+                if any(tag in tags for tag in memory_tags):
+                    results.append(memory)
+
+            results.sort(key=lambda memory: str(memory.get("id") or ""))
+            results.sort(key=lambda memory: str(memory.get("timestamp") or ""), reverse=True)
+            results.sort(key=lambda memory: float(memory.get("importance") or 0.0), reverse=True)
+
+            offset_param = params.get("offset")
+            offset = 0 if offset_param is None else max(0, int(offset_param))
+            limit_param = params.get("limit_plus_one", params.get("limit"))
+            limit = len(results) if limit_param is None else int(limit_param)
+            paged = results[offset : offset + limit]
+            return FakeResult([[FakeNode(memory)] for memory in paged])
+
+        # Bulk fetch for reembed
+        if "MATCH (m:Memory)" in query and "RETURN m.id, m.content" in query:
+            rows: List[List[Any]] = []
+            for memory_id, memory in self.memories.items():
+                if memory.get("content"):
+                    rows.append([memory_id, memory.get("content", "")])
+            return FakeResult(rows)
+
+        if (
+            "MATCH (m:Memory)" in query
+            and "RETURN m.id AS id" in query
+            and "m.content AS content" in query
+        ):
+            rows = []
+            for memory_id, memory in self.memories.items():
+                if memory.get("content"):
+                    rows.append(
+                        [
+                            memory_id,
+                            memory.get("content", ""),
+                            memory.get("tags", []),
+                            memory.get("importance", 0.5),
+                            memory.get("timestamp"),
+                            memory.get("type", "Context"),
+                            memory.get("confidence", 0.6),
+                            memory.get("metadata", "{}"),
+                            memory.get("updated_at"),
+                            memory.get("last_accessed"),
+                        ]
+                    )
+            return FakeResult(rows)
+
+        if "MATCH (m:Memory)" in query and "RETURN m.id AS id" in query:
+            excluded_types = params.get("excluded_types") or []
+            rows = [
+                [memory_id]
+                for memory_id, memory in self.memories.items()
+                if _memory_type_allowed(memory, excluded_types)
+            ]
+            return FakeResult(rows)
+
+        # Startup recall query patterns
+        if "WHERE 'critical' IN m.tags OR 'lesson' IN m.tags OR 'ai-assistant' IN m.tags" in query:
+            rows = []
+            for memory in self.memories.values():
+                tags = [
+                    str(tag).strip().lower()
+                    for tag in (memory.get("tags") or [])
+                    if isinstance(tag, str) and tag.strip()
+                ]
+                if any(tag in {"critical", "lesson", "ai-assistant"} for tag in tags):
+                    metadata = memory.get("metadata", "{}")
+                    if isinstance(metadata, dict):
+                        metadata = json.dumps(metadata)
+                    rows.append(
+                        [
+                            memory.get("id"),
+                            memory.get("content"),
+                            memory.get("tags", []),
+                            memory.get("importance", 0.5),
+                            memory.get("type", "Context"),
+                            metadata,
+                        ]
+                    )
+            rows.sort(key=lambda row: float(row[3] or 0.0), reverse=True)
+            return FakeResult(rows[:10])
+
+        if "WHERE 'system' IN m.tags OR 'memory-recall' IN m.tags" in query:
+            rows = []
+            for memory in self.memories.values():
+                tags = [
+                    str(tag).strip().lower()
+                    for tag in (memory.get("tags") or [])
+                    if isinstance(tag, str) and tag.strip()
+                ]
+                if any(tag in {"system", "memory-recall"} for tag in tags):
+                    rows.append(
+                        [
+                            memory.get("id"),
+                            memory.get("content"),
+                            memory.get("tags", []),
+                        ]
+                    )
+            return FakeResult(rows[:5])
+
+        # Association creation
+        if (
+            "UNWIND $rows AS row" in query
+            and "MATCH (m1:Memory" in query
+            and "MATCH (m2:Memory" in query
+            and "MERGE (m1)-[r:" in query
+        ):
+            relation_type = "RELATES_TO"
+            match = re.search(r"MERGE \(m1\)-\[r:([A-Z_]+)\]->\(m2\)", query)
+            if match:
+                relation_type = match.group(1)
+            if relation_type in self.association_error_types:
+                raise RuntimeError(f"simulated association error for {relation_type}")
+            result_rows = []
+            for row in params.get("rows") or []:
+                memory1_id = str(row.get("memory1_id") or "")
+                memory2_id = str(row.get("memory2_id") or "")
+                if memory1_id not in self.memories or memory2_id not in self.memories:
+                    continue
+                props = row.get("props") if isinstance(row.get("props"), dict) else {}
+                strength = props.get("strength")
+                self.relationships.append(
+                    {
+                        "id1": memory1_id,
+                        "id2": memory2_id,
+                        "type": relation_type,
+                        "strength": float(0.5 if strength is None else strength),
+                        "context": props.get("context"),
+                        "reason": props.get("reason"),
+                        "kind": props.get("kind"),
+                        "origin": props.get("origin"),
+                        "confidence": props.get("confidence"),
+                        "similarity": props.get("similarity"),
+                        "updated_at": props.get("updated_at"),
+                    }
+                )
+                result_rows.append([row.get("index"), memory1_id, memory2_id])
+            return FakeResult(result_rows)
+
+        if (
+            "MATCH (m1:Memory" in query
+            and "MATCH (m2:Memory" in query
+            and "MERGE (m1)-[r:" in query
+        ):
+            memory1_id = str(params.get("id1") or "")
+            memory2_id = str(params.get("id2") or "")
+            relation_type = "RELATES_TO"
+            match = re.search(r"MERGE \(m1\)-\[r:([A-Z_]+)\]->\(m2\)", query)
+            if match:
+                relation_type = match.group(1)
+            strength = params.get("strength")
+            self.relationships.append(
+                {
+                    "id1": memory1_id,
+                    "id2": memory2_id,
+                    "type": relation_type,
+                    "strength": float(0.5 if strength is None else strength),
+                    "context": params.get("context"),
+                    "reason": params.get("reason"),
+                    "kind": params.get("kind"),
+                    "origin": params.get("origin"),
+                    "confidence": params.get("confidence"),
+                    "similarity": params.get("similarity"),
+                    "updated_at": params.get("updated_at"),
+                }
+            )
+            return FakeResult([["created"]])
+
+        if (
+            "MATCH (m:Memory {id: $id})-[r" in query
+            and "RETURN type(r) as relation_type" in query
+            and "related" in query
+        ):
+            memory_id = str(params.get("id") or "")
+            requested_types = {
+                str(rel_type).strip()
+                for rel_type in (params.get("types") or [])
+                if str(rel_type).strip()
+            }
+            directed = "]->" in query
+            rows = []
+            for rel in self.relationships:
+                rel_type = str(rel.get("type") or "")
+                if requested_types and rel_type not in requested_types:
+                    continue
+                related_id = None
+                if rel.get("id1") == memory_id:
+                    related_id = str(rel.get("id2") or "")
+                elif not directed and rel.get("id2") == memory_id:
+                    related_id = str(rel.get("id1") or "")
+                if not related_id:
+                    continue
+                related = self.memories.get(related_id)
+                if related is None:
+                    continue
+                rows.append(
+                    [
+                        rel_type,
+                        rel.get("strength", 0.5),
+                        rel.get("kind"),
+                        FakeNode(related),
+                    ]
+                )
+            return FakeResult(rows[: int(params.get("limit") or len(rows) or 1)])
+
+        if (
+            "UNWIND $ids AS source_id" in query
+            and "RETURN source_id" in query
+            and "related" in query
+        ):
+            source_ids = [str(memory_id) for memory_id in (params.get("ids") or [])]
+            requested_types = {
+                str(rel_type).strip()
+                for rel_type in (params.get("types") or [])
+                if str(rel_type).strip()
+            }
+            rows = []
+            for source_id in source_ids:
+                for rel in self.relationships:
+                    rel_type = str(rel.get("type") or "")
+                    if requested_types and rel_type not in requested_types:
+                        continue
+                    if rel.get("id1") != source_id:
+                        continue
+                    related_id = str(rel.get("id2") or "")
+                    related = self.memories.get(related_id)
+                    if related is None:
+                        continue
+                    rows.append(
+                        [
+                            source_id,
+                            rel_type,
+                            rel.get("strength", 0.5),
+                            rel.get("kind"),
+                            FakeNode(related),
+                        ]
+                    )
+            return FakeResult(rows)
+
+        # Recall-style graph query over memories
+        if (
+            "MATCH (m:Memory)" in query
+            and _returns_whole_memory_node(query)
+            and "ORDER BY" in query
+        ):
+            results = list(self.memories.values())
+
+            tag_filters = [
+                str(tag).strip().lower()
+                for tag in (params.get("tag_filters") or [])
+                if isinstance(tag, str) and tag.strip()
+            ]
+            exact_tags = [
+                str(tag).strip().lower()
+                for tag in (params.get("tags") or [])
+                if isinstance(tag, str) and tag.strip()
+            ]
+
+            if tag_filters:
+                filtered = []
+                for memory in results:
+                    memory_tags = [
+                        str(tag).strip().lower()
+                        for tag in (memory.get("tags") or [])
+                        if isinstance(tag, str) and tag.strip()
+                    ]
+                    if any(
+                        any(tag.startswith(prefix) for tag in memory_tags) for prefix in tag_filters
+                    ):
+                        filtered.append(memory)
+                results = filtered
+            elif exact_tags:
+                filtered = []
+                for memory in results:
+                    memory_tags = [
+                        str(tag).strip().lower()
+                        for tag in (memory.get("tags") or [])
+                        if isinstance(tag, str) and tag.strip()
+                    ]
+                    if any(tag in memory_tags for tag in exact_tags):
+                        filtered.append(memory)
+                results = filtered
+
+            def _timestamp_key(memory: Dict[str, Any]) -> str:
+                if "coalesce(m.updated_at, m.timestamp)" in query:
+                    return str(memory.get("updated_at") or memory.get("timestamp") or "")
+                return str(memory.get("timestamp") or "")
+
+            def _importance(memory: Dict[str, Any]) -> float:
+                try:
+                    return float(memory.get("importance") or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            if "ORDER BY m.timestamp ASC" in query:
+                results.sort(key=lambda memory: (_timestamp_key(memory), -_importance(memory)))
+            elif "ORDER BY m.timestamp DESC" in query:
+                results.sort(
+                    key=lambda memory: (_timestamp_key(memory), _importance(memory)),
+                    reverse=True,
+                )
+            elif "ORDER BY coalesce(m.updated_at, m.timestamp) ASC" in query:
+                results.sort(key=lambda memory: (_timestamp_key(memory), -_importance(memory)))
+            elif "ORDER BY coalesce(m.updated_at, m.timestamp) DESC" in query:
+                results.sort(
+                    key=lambda memory: (_timestamp_key(memory), _importance(memory)),
+                    reverse=True,
+                )
+            else:
+                results.sort(
+                    key=lambda memory: (_importance(memory), _timestamp_key(memory)),
+                    reverse=True,
+                )
+
+            limit_param = params.get("limit")
+            limit = len(results) if limit_param is None else int(limit_param)
+            return FakeResult([[FakeNode(memory)] for memory in results[:limit]])
+
+        # Analytics query patterns
+        if "MATCH (m:Memory)" in query and "RETURN m.type, COUNT(m)" in query:
+            type_counts: Dict[str, Dict[str, float]] = {}
+            for memory in self.memories.values():
+                memory_type = str(memory.get("type") or "Memory")
+                current = type_counts.setdefault(memory_type, {"count": 0, "total": 0.0})
+                current["count"] += 1
+                current["total"] += float(memory.get("confidence") or 0.5)
+            rows = []
+            for memory_type, data in type_counts.items():
+                count = int(data["count"])
+                avg = data["total"] / count if count else 0.0
+                rows.append([memory_type, count, avg])
+            return FakeResult(rows)
+
+        if "MATCH (p:Pattern)" in query:
+            return FakeResult([])
+
+        if "MATCH (m1:Memory)-[r:PREFERS_OVER]" in query:
+            rows = []
+            for rel in self.relationships:
+                if rel.get("type") != "PREFERS_OVER":
+                    continue
+                memory1 = self.memories.get(str(rel.get("id1") or ""), {})
+                memory2 = self.memories.get(str(rel.get("id2") or ""), {})
+                rows.append(
+                    [
+                        memory1.get("content", ""),
+                        memory2.get("content", ""),
+                        rel.get("context"),
+                        rel.get("strength", 0.5),
+                    ]
+                )
+            rows.sort(key=lambda row: float(row[3] or 0.0), reverse=True)
+            return FakeResult(rows[:10])
+
+        if "MATCH (m:Memory {id: $id})" in query and (
+            "RETURN DISTINCT related" in query or "WITH DISTINCT related" in query
+        ):
+            memory_id = str(params.get("id") or "")
+            requested_types: set[str] = set()
+            filter_match = re.search(r"relationshipFilter:\s*'([^']*)'", query)
+            if filter_match:
+                requested_types = {
+                    part.strip() for part in filter_match.group(1).split("|") if part.strip()
+                }
+            elif "-[r:" in query:
+                pattern_match = re.search(r"-\[r:([A-Z_|]+)", query)
+                if pattern_match:
+                    requested_types = {
+                        part.strip() for part in pattern_match.group(1).split("|") if part.strip()
+                    }
+
+            related_nodes: List[Dict[str, Any]] = []
+            for rel in self.relationships:
+                rel_type = str(rel.get("type") or "")
+                if requested_types and rel_type not in requested_types:
+                    continue
+                if rel.get("id1") == memory_id:
+                    related = self.memories.get(str(rel.get("id2") or ""))
+                elif rel.get("id2") == memory_id:
+                    related = self.memories.get(str(rel.get("id1") or ""))
+                else:
+                    related = None
+                if related is not None:
+                    related_nodes.append(related)
+
+            related_nodes.sort(
+                key=lambda memory: (
+                    float(memory.get("importance") or 0.0),
+                    str(memory.get("timestamp") or ""),
+                ),
+                reverse=True,
+            )
+            limit = int(params.get("limit") or len(related_nodes))
+            deduped: List[Dict[str, Any]] = []
+            seen_related_ids: set[str] = set()
+            for memory in related_nodes:
+                memory_id_value = str(memory.get("id") or "")
+                if memory_id_value in seen_related_ids:
+                    continue
+                seen_related_ids.add(memory_id_value)
+                deduped.append(memory)
+            return FakeResult([[FakeNode(memory)] for memory in deduped[:limit]])
+
+        if "RETURN m.timestamp, m.importance" in query:
+            rows = []
+            for memory in self.memories.values():
+                if memory.get("timestamp") is not None:
+                    rows.append([memory.get("timestamp"), memory.get("importance", 0.5)])
+            return FakeResult(rows[:100])
+
+        if "WHEN m.confidence" in query:
+            buckets = {"low": 0, "medium": 0, "high": 0}
+            for memory in self.memories.values():
+                try:
+                    confidence = float(memory.get("confidence") or 0.0)
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                if confidence < 0.3:
+                    buckets["low"] += 1
+                elif confidence < 0.7:
+                    buckets["medium"] += 1
+                else:
+                    buckets["high"] += 1
+            rows = [[level, count] for level, count in buckets.items() if count > 0]
+            if not rows:
+                rows = [["medium", 0]]
+            return FakeResult(rows)
+
+        if (
+            "MATCH (m:Memory)" in query
+            and "WHERE m.confidence IS NOT NULL" in query
+            and "RETURN m.confidence" in query
+        ):
+            rows = []
+            for memory in self.memories.values():
+                confidence = memory.get("confidence")
+                if confidence is None:
+                    continue
+                rows.append([confidence])
+            return FakeResult(rows[:500])
+
+        if (
+            "MATCH (m:Memory)" in query
+            and "WHERE m.metadata IS NOT NULL" in query
+            and "RETURN m.metadata" in query
+        ):
+            rows = []
+            for memory in self.memories.values():
+                metadata = memory.get("metadata")
+                if metadata is None:
+                    continue
+                rows.append([metadata])
+            return FakeResult(rows[:200])
+
+        if "MATCH (m:Memory)" in query and "RETURN m.content" in query:
+            rows = [[memory.get("content", "")] for memory in list(self.memories.values())[:100]]
+            return FakeResult(rows)
+
+        if "MATCH (m:Memory {id:" in query and "RETURN type" in query:
+            return FakeResult([])
+
+        # Default: no rows
+        return FakeResult([])

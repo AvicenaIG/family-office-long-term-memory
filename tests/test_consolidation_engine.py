@@ -9,117 +9,294 @@ import pytest
 
 import consolidation as consolidation_module
 from automem.consolidation.runtime_helpers import (
+    build_consolidator_from_config,
+    persist_consolidation_run,
 )
 from consolidation import MemoryConsolidator
 from tests.support.fake_graph import FakeGraph  # noqa: F401 - used via dummy_graph fixture
 
 
 class FakeVectorStore:
-    pass  # TODO: implement
     def __init__(self) -> None:
-        pass  # TODO: implement
+        self.deletions: List[tuple[str, Dict[str, Any]]] = []
 
     def delete(self, collection_name: str, points_selector: Dict[str, Any]) -> None:
-        pass  # TODO: implement
+        self.deletions.append((collection_name, points_selector))
 
 
 @pytest.fixture(autouse=True)
 def freeze_time(monkeypatch: pytest.MonkeyPatch) -> None:
-    pass  # TODO: implement
+    """Use a fixed timestamp to keep decay calculations deterministic."""
 
     class FixedDatetime(datetime):
-        pass  # TODO: implement
+        @classmethod
         def now(cls, tz: timezone | None = None) -> datetime:
-            pass  # TODO: implement
+            base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+            return base if tz is None else base.astimezone(tz)
 
+    monkeypatch.setattr(consolidation_module, "datetime", FixedDatetime)
+    yield
+    monkeypatch.setattr(consolidation_module, "datetime", datetime)
 
 
 def iso_days_ago(days: int) -> str:
-    pass  # TODO: implement
+    base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    return (base - timedelta(days=days)).isoformat()
 
 
 def test_calculate_relevance_score_accounts_for_relationships(dummy_graph) -> None:
-    pass  # TODO: implement
+    graph = dummy_graph
+    graph.relationship_counts["m1"] = 0
+    consolidator = MemoryConsolidator(graph)
 
+    common_memory = {
+        "id": "m1",
+        "timestamp": iso_days_ago(1),
+        "importance": 0.6,
+        "confidence": 0.6,
+    }
 
+    baseline = consolidator.calculate_relevance_score(common_memory.copy())
 
+    # Clear the LRU cache to ensure the updated relationship count is fetched
+    consolidator._get_relationship_count_cached_impl.cache_clear()
 
+    graph.relationship_counts["m1"] = 6
+    boosted = consolidator.calculate_relevance_score(common_memory.copy())
 
+    assert boosted > baseline
+    assert 0 < boosted <= 1
 
 
 def test_discover_creative_associations_builds_connections(dummy_graph) -> None:
-    pass  # TODO: implement
+    graph = dummy_graph
+    graph.sample_rows = [
+        ["decision-a", "Chose approach A", "Decision", [1.0, 0.0, 0.0], iso_days_ago(3)],
+        ["decision-b", "Chose approach B", "Decision", [0.0, 1.0, 0.0], iso_days_ago(4)],
+        ["insight", "Insight about A", "Insight", [0.9, 0.1, 0.0], iso_days_ago(5)],
+    ]
 
+    consolidator = MemoryConsolidator(graph)
+    associations = consolidator.discover_creative_associations(sample_size=3)
 
+    assert any(item["type"] == "CONTRASTS_WITH" for item in associations)
 
 
 def test_consolidate_creative_writes_discovered_edges(dummy_graph) -> None:
-    pass  # TODO: implement
+    graph = dummy_graph
+    graph.sample_rows = [
+        ["insight-a", "Insight about A", "Insight", [1.0, 0.0, 0.0], iso_days_ago(3)],
+        ["pattern-b", "Pattern about A", "Pattern", [0.9, 0.1, 0.0], iso_days_ago(4)],
+    ]
 
+    consolidator = MemoryConsolidator(graph)
+    results = consolidator.consolidate(mode="creative", dry_run=False)
 
+    assert results["steps"]["creative"]["created"] == 1
+    assert graph.relationships
+    rel = graph.relationships[0]
+    assert rel["type"] == "DISCOVERED"
+    assert rel["kind"] == "explains"
+    assert rel["origin"] == "consolidation"
 
 
 def test_cluster_similar_memories_groups_items(dummy_graph) -> None:
-    pass  # TODO: implement
+    graph = dummy_graph
+    graph.cluster_rows = [
+        ["m1", "Alpha", [1.0, 0.0], "Insight"],
+        ["m2", "Alpha follow-up", [0.95, 0.05], "Insight"],
+        ["m3", "Alpha summary", [1.02, -0.02], "Pattern"],
+    ]
 
+    consolidator = MemoryConsolidator(graph)
+    clusters = consolidator.cluster_similar_memories()
 
+    assert clusters
+    assert clusters[0]["size"] == 3
+    assert clusters[0]["dominant_type"] in {"Insight", "Pattern"}
 
 
 def test_build_consolidator_from_config_preserves_cluster_defaults(dummy_graph) -> None:
-    pass  # TODO: implement
+    consolidator = build_consolidator_from_config(
+        dummy_graph,
+        None,
+        memory_consolidator_cls=MemoryConsolidator,
+        delete_threshold=0.05,
+        archive_threshold=0.2,
+        grace_period_days=90,
+        importance_protection_threshold=0.7,
+        protected_types={"Decision", "Insight"},
+    )
 
+    assert consolidator.similarity_threshold == 0.75
+    assert consolidator.min_cluster_size == 3
 
 
 def test_build_consolidator_from_config_applies_cluster_overrides(dummy_graph) -> None:
-    pass  # TODO: implement
+    consolidator = build_consolidator_from_config(
+        dummy_graph,
+        None,
+        memory_consolidator_cls=MemoryConsolidator,
+        delete_threshold=0.05,
+        archive_threshold=0.2,
+        grace_period_days=90,
+        importance_protection_threshold=0.7,
+        protected_types={"Decision", "Insight"},
+        cluster_similarity_threshold=0.65,
+        min_cluster_size=2,
+    )
 
+    assert consolidator.similarity_threshold == 0.65
+    assert consolidator.min_cluster_size == 2
 
 
 def test_persist_full_consolidation_does_not_advance_skipped_identity() -> None:
-    pass  # TODO: implement
     class RecordingGraph:
-        pass  # TODO: implement
         def __init__(self) -> None:
-            pass  # TODO: implement
+            self.queries: List[tuple[str, Dict[str, Any]]] = []
 
         def query(self, query: str, params: Dict[str, Any] | None = None) -> Any:
-            pass  # TODO: implement
+            self.queries.append((query, params or {}))
+            return SimpleNamespace(result_set=[])
 
+    graph = RecordingGraph()
+    task_fields = {
+        "decay": "decay_last_run",
+        "creative": "creative_last_run",
+        "cluster": "cluster_last_run",
+        "forget": "forget_last_run",
+        "identity": "identity_last_run",
+        "full": "full_last_run",
+    }
 
+    persist_consolidation_run(
+        graph,
+        {
+            "mode": "full",
+            "success": True,
+            "dry_run": False,
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "completed_at": "2026-01-01T00:00:01+00:00",
+            "steps": {"identity": {"skipped": True, "reason": "disabled"}},
+        },
+        logger=SimpleNamespace(exception=lambda *args, **kwargs: None),
+        run_label="ConsolidationRun",
+        control_label="ConsolidationControl",
+        control_node_id="singleton",
+        task_fields=task_fields,
+        history_limit=10,
+        utc_now_fn=lambda: "2026-01-01T00:00:02+00:00",
+    )
 
+    control_updates = "\n".join(
+        query for query, _params in graph.queries if "MERGE (c:ConsolidationControl" in query
+    )
+    assert "identity_last_run" not in control_updates
+    assert "full_last_run" in control_updates
 
 
 def test_get_openai_client_omits_whitespace_base_url(
-    pass  # TODO: implement
+    monkeypatch: pytest.MonkeyPatch,
+    dummy_graph,
 ) -> None:
+    calls: List[Dict[str, Any]] = []
 
     class OpenAIModule:
-        pass  # TODO: implement
+        @staticmethod
         def OpenAI(**kwargs: Any) -> object:
-            pass  # TODO: implement
+            calls.append(kwargs)
+            return object()
 
+    monkeypatch.setitem(sys.modules, "openai", OpenAIModule)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "   ")
 
+    client = MemoryConsolidator(dummy_graph)._get_openai_client()
 
+    assert client is not None
+    assert calls == [{"api_key": "test-key"}]
 
 
 def build_forgetting_rows() -> List[List[Any]]:
-    pass  # TODO: implement
+    return [
+        [
+            "recent-keep",
+            "Fresh important memory",
+            0.8,
+            iso_days_ago(2),
+            "Insight",
+            0.9,
+            iso_days_ago(1),
+        ],
+        [
+            "archive-candidate",
+            "Memory to archive",
+            0.1,
+            iso_days_ago(15),
+            "Memory",
+            0.1,
+            iso_days_ago(15),
+        ],
+        [
+            "old-delete",
+            "Superseded note",
+            0.01,
+            iso_days_ago(365),
+            "Memory",
+            0.1,
+            iso_days_ago(365),
+        ],
+    ]
 
 
 def test_apply_controlled_forgetting_dry_run(dummy_graph) -> None:
-    pass  # TODO: implement
+    graph = dummy_graph
+    graph.relationship_counts["recent-keep"] = 5
+    graph.forgetting_rows = build_forgetting_rows()
 
+    consolidator = MemoryConsolidator(graph)
+    stats = consolidator.apply_controlled_forgetting(dry_run=True)
 
+    assert stats["examined"] == 3
+    assert stats["preserved"] == 2
+    assert len(stats["archived"]) == 0
+    assert len(stats["deleted"]) == 1
+    assert len(stats["protected"]) == 1
+    assert graph.deleted == []
 
 
 def test_apply_controlled_forgetting_updates_graph_and_vector_store(dummy_graph) -> None:
-    pass  # TODO: implement
+    graph = dummy_graph
+    graph.relationship_counts["recent-keep"] = 5
+    graph.forgetting_rows = build_forgetting_rows()
 
+    vector_store = FakeVectorStore()
+    consolidator = MemoryConsolidator(graph, vector_store=vector_store)
 
+    stats = consolidator.apply_controlled_forgetting(dry_run=False)
 
+    assert stats["preserved"] == 2
+    assert graph.updated_scores  # recent memory updated in graph
+    assert graph.archived == []
+    assert graph.deleted == ["old-delete"]
+    assert vector_store.deletions
+    collection, selector = vector_store.deletions[0]
+    assert collection == "memories"
+    points = selector.get("point_ids") or selector.get("points")
+    assert points == ["old-delete"]
 
 
 def test_apply_decay_updates_scores(dummy_graph) -> None:
-    pass  # TODO: implement
+    graph = dummy_graph
+    graph.relationship_counts = {"a": 0, "b": 2}
+    graph.decay_rows = [
+        ["a", "Early note", iso_days_ago(10), 0.5, iso_days_ago(10), 0.5],
+        ["b", "Recent insight", iso_days_ago(1), 0.7, iso_days_ago(1), 0.9],
+    ]
 
+    consolidator = MemoryConsolidator(graph)
+    stats = consolidator._apply_decay()
 
+    assert stats["processed"] == 2
+    assert len(graph.updated_scores) == 2
+    assert stats["avg_relevance_after"] <= 1
