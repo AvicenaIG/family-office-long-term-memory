@@ -1,0 +1,180 @@
+"""
+LongMemEval Benchmark Configuration Variants
+
+Defines different recall and storage configurations to test AutoMem's
+performance across different settings.
+"""
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+@dataclass
+class LongMemEvalConfig:
+    """Configuration for LongMemEval benchmark evaluation."""
+
+    # Backend settings
+    backend: str = "automem"
+    base_url: str = os.getenv("AUTOMEM_TEST_BASE_URL", "http://localhost:8001")
+    api_token: str = os.getenv("AUTOMEM_TEST_API_TOKEN", "test-token")
+    work_dir: Optional[str] = None
+
+    # Dataset paths
+    data_file: str = str(Path(__file__).parent / "data" / "longmemeval_s_cleaned.json")
+    oracle_file: str = str(Path(__file__).parent / "data" / "longmemeval_oracle.json")
+    results_dir: str = str(Path(__file__).parent / "results")
+
+    # Storage strategy: "per-session" or "per-turn"
+    storage_strategy: str = "per-session"
+
+    # Recall settings
+    recall_limit: int = 10
+    expand_entities: bool = False
+    expand_relations: bool = False
+    auto_decompose: bool = False
+    use_temporal_hints: bool = False
+    # Answer-assembly flags. Defaults off keep the prompt byte-identical
+    # to the historical baseline. ``temporal_answer_hint`` renders memories
+    # chronologically with conflict-recency guidance. ``answer_focus_prompt``
+    # keeps retrieval-rank order but makes evidence extraction explicit.
+    temporal_answer_hint: bool = False
+    answer_focus_prompt: bool = False
+
+    # Memory importance
+    importance: float = 0.5
+
+    # Answer generation
+    llm_model: str = os.getenv("LONGMEMEVAL_LLM_MODEL", "gpt-5-mini")
+    eval_llm_model: Optional[str] = os.getenv("LONGMEMEVAL_EVAL_LLM_MODEL")
+    use_chain_of_note: bool = True
+
+    # Performance tuning
+    batch_size: int = 20  # Sessions to store before pausing
+    pause_between_batches: float = 0.3
+    request_timeout: int = 30
+
+    # Evaluation
+    use_llm_eval: bool = False  # Use canonical OpenAI judge for evaluation (costs money)
+    max_questions: int = 0  # 0 = all questions
+    per_type: int = 0  # 0 = no stratified selection; otherwise questions per type
+
+    # Tag prefix for cleanup
+    tag_prefix: str = "longmemeval"
+
+    # Config name for results tracking
+    name: str = "baseline"
+
+
+# Pre-defined benchmark configurations
+BENCHMARK_CONFIGS: Dict[str, dict] = {
+    "baseline": {
+        "name": "baseline",
+        "storage_strategy": "per-session",
+        "recall_limit": 10,
+        "expand_entities": False,
+        "expand_relations": False,
+        "auto_decompose": False,
+        "use_temporal_hints": False,
+        "temporal_answer_hint": False,
+        "answer_focus_prompt": False,
+    },
+    "per-turn": {
+        "name": "per-turn",
+        "storage_strategy": "per-turn",
+        "recall_limit": 10,
+        "expand_entities": False,
+        "expand_relations": False,
+        "auto_decompose": False,
+        "use_temporal_hints": False,
+        "temporal_answer_hint": False,
+        "answer_focus_prompt": False,
+    },
+    "expand-entities": {
+        "name": "expand-entities",
+        "storage_strategy": "per-session",
+        "recall_limit": 10,
+        "expand_entities": True,
+        "expand_relations": False,
+        "auto_decompose": False,
+        "use_temporal_hints": False,
+        "temporal_answer_hint": False,
+        "answer_focus_prompt": False,
+    },
+    "expand-relations": {
+        "name": "expand-relations",
+        "storage_strategy": "per-session",
+        "recall_limit": 10,
+        "expand_entities": False,
+        "expand_relations": True,
+        "auto_decompose": False,
+        "use_temporal_hints": False,
+        "temporal_answer_hint": False,
+        "answer_focus_prompt": False,
+    },
+    "high-k": {
+        "name": "high-k",
+        "storage_strategy": "per-session",
+        "recall_limit": 20,
+        "expand_entities": False,
+        "expand_relations": False,
+        "auto_decompose": False,
+        "use_temporal_hints": False,
+        "temporal_answer_hint": False,
+        "answer_focus_prompt": False,
+    },
+    "temporal": {
+        "name": "temporal",
+        "storage_strategy": "per-session",
+        "recall_limit": 10,
+        "expand_entities": False,
+        "expand_relations": False,
+        "auto_decompose": False,
+        "use_temporal_hints": True,
+        "temporal_answer_hint": False,
+        "answer_focus_prompt": False,
+    },
+    "temporal-answer": {
+        "name": "temporal-answer",
+        "storage_strategy": "per-session",
+        "recall_limit": 10,
+        "expand_entities": False,
+        "expand_relations": False,
+        "auto_decompose": False,
+        "use_temporal_hints": False,
+        "temporal_answer_hint": True,
+        "answer_focus_prompt": False,
+    },
+    "evidence-answer": {
+        "name": "evidence-answer",
+        "storage_strategy": "per-session",
+        "recall_limit": 10,
+        "expand_entities": False,
+        "expand_relations": False,
+        "auto_decompose": False,
+        "use_temporal_hints": False,
+        "temporal_answer_hint": False,
+        "answer_focus_prompt": True,
+    },
+    "full-graph": {
+        "name": "full-graph",
+        "storage_strategy": "per-session",
+        "recall_limit": 20,
+        "expand_entities": True,
+        "expand_relations": True,
+        "auto_decompose": True,
+        "use_temporal_hints": True,
+        "temporal_answer_hint": False,
+        "answer_focus_prompt": False,
+    },
+}
+
+
+def get_config(name: str = "baseline", **overrides) -> LongMemEvalConfig:
+    """Get a benchmark config by name with optional overrides."""
+    if name in BENCHMARK_CONFIGS:
+        params = {**BENCHMARK_CONFIGS[name], **overrides}
+    else:
+        params = {"name": name, **overrides}
+    return LongMemEvalConfig(**params)
